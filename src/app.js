@@ -12,7 +12,7 @@ const FEED_VP = 'https://gtfsrt.renfe.com/vehicle_positions.json';
 // gtfsrt.renfe.com sends no Access-Control-Allow-Origin header, so the browser cannot read it directly.
 // Renfe URLs are always fetched through this relay (see worker/worker.js); the Configuració field overrides it.
 const DEFAULT_PROXY = 'https://rodalies-proxy.raimon-rafols.workers.dev/?url=';
-const DEFAULTS = { origin: '71700', destination: '71801', holiday: false, onlyLive: false, gmapsKey: '', proxy: '', feedUrl: FEED_TU };
+const DEFAULTS = { origin: '71700', destination: '71801', onlyLive: false, gmapsKey: '', proxy: '', feedUrl: FEED_TU };
 const REFRESH_MS = 30000;
 const R2_FAMILY = new Set(['R2', 'R2S', 'R2N']);
 
@@ -48,8 +48,40 @@ function serviceDay(now) {
   }
   return { y: p.y, m: p.m, d: p.d, dow: p.dow, nowMin: p.h * 60 + p.mi };
 }
+// ---------- public holidays (Catalonia + Barcelona city), computed for any year ----------
+function easterSunday(y) { // Anonymous Gregorian algorithm → {m, d}
+  const a = y % 19, b = Math.floor(y / 100), c = y % 100, d = Math.floor(b / 4), e = b % 4;
+  const f = Math.floor((b + 8) / 25), g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7, m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31), day = ((h + l - 7 * m + 114) % 31) + 1;
+  return { m: month, d: day };
+}
+function addDays(y, m, d, n) { const t = new Date(Date.UTC(y, m - 1, d + n)); return { m: t.getUTCMonth() + 1, d: t.getUTCDate() }; }
+function holidaysFor(y) {
+  const e = easterSunday(y);
+  const list = [
+    [1, 1, 'Any Nou'], [1, 6, 'Reis'],
+    [addDays(y, e.m, e.d, -2), 'Divendres Sant'], [addDays(y, e.m, e.d, 1), 'Dilluns de Pasqua Florida'],
+    [5, 1, 'Festa del Treball'], [addDays(y, e.m, e.d, 50), 'Segona Pasqua (Barcelona)'],
+    [6, 24, 'Sant Joan'], [8, 15, "L'Assumpció"], [9, 11, 'Diada Nacional de Catalunya'], [9, 24, 'La Mercè (Barcelona)'],
+    [10, 12, 'Festa Nacional d\'Espanya'], [11, 1, 'Tots Sants'], [12, 6, 'Dia de la Constitució'], [12, 8, 'La Immaculada'],
+    [12, 25, 'Nadal'], [12, 26, 'Sant Esteve'],
+  ];
+  const map = new Map();
+  for (const h of list) {
+    const [md, name] = h.length === 3 ? [{ m: h[0], d: h[1] }, h[2]] : h;
+    map.set(`${md.m}-${md.d}`, name);
+  }
+  return map;
+}
+const holidayCache = new Map();
+function holidayName(sd) { // name of the holiday on service day sd, or null
+  if (!holidayCache.has(sd.y)) holidayCache.set(sd.y, holidaysFor(sd.y));
+  return holidayCache.get(sd.y).get(`${sd.m}-${sd.d}`) || null;
+}
+
 function dayTags(sd) {
-  const holiday = settings.holiday;
+  const holiday = !!holidayName(sd);
   const tags = new Set(['all']);
   if (holiday || sd.dow === 0) { tags.add('we'); tags.add('sun'); }
   else if (sd.dow === 6) { tags.add('we'); tags.add('sat'); }
@@ -153,7 +185,40 @@ function pathBetween(a, b) {
   pathCache.set(key, best);
   return best;
 }
+// Real track geometry from src/tracks.js (OpenStreetMap route relations, built by tools/build_tracks.py).
+// Each track: pts [[lat,lng]...] along the line, st { stop_id: metres from pts[0] }. Cumulative lengths are computed lazily.
+const TRACKS = window.TRACKS || {};
+const trackGeomCache = new Map();
+function trackGeom(line) {
+  if (trackGeomCache.has(line)) return trackGeomCache.get(line);
+  const t = TRACKS[line]; let g = null;
+  if (t && t.pts.length > 1) {
+    const pts = t.pts.map(([lat, lng]) => ({ lat, lng })), cum = [0];
+    for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + distM(pts[i - 1], pts[i]));
+    g = { pts, cum, st: t.st };
+  }
+  trackGeomCache.set(line, g);
+  return g;
+}
+function distM(p, q) { const kx = Math.cos((p.lat + q.lat) / 2 * Math.PI / 180); return Math.hypot((p.lat - q.lat) * 111320, (p.lng - q.lng) * 111320 * kx); }
+function pointAtChainage(g, c) {
+  const { pts, cum } = g;
+  if (c <= 0) return pts[0];
+  if (c >= cum[cum.length - 1]) return pts[pts.length - 1];
+  let lo = 0, hi = cum.length - 1;
+  while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (cum[mid] <= c) lo = mid; else hi = mid; }
+  const seg = cum[hi] - cum[lo], f = seg ? (c - cum[lo]) / seg : 0, p = pts[lo], q = pts[hi];
+  return { lat: p.lat + (q.lat - p.lat) * f, lng: p.lng + (q.lng - p.lng) * f };
+}
+// the track (preferring `line`) that carries both stations
+function trackFor(a, b, line) {
+  const order = line && TRACKS[line] ? [line, ...Object.keys(TRACKS).filter(k => k !== line)] : Object.keys(TRACKS);
+  for (const l of order) { const g = trackGeom(l); if (g && a in g.st && b in g.st) return g; }
+  return null;
+}
 function linePath(line) {
+  const g = trackGeom(line);
+  if (g) return g.pts;
   const st = LINES[line].stations, out = [];
   for (let i = 0; i < st.length - 1; i++) {
     const seg = pathBetween(st[i], st[i + 1]);
@@ -166,7 +231,10 @@ function dist(p, q) { // equirectangular approximation, good enough at this scal
   return Math.hypot((p.lat - q.lat), (p.lng - q.lng) * kx);
 }
 // position at fraction `frac` of the track length between station a and station b
-function alongTrack(a, b, frac) {
+function alongTrack(a, b, frac, line) {
+  const g = trackFor(a, b, line);
+  if (g) return pointAtChainage(g, g.st[a] + (g.st[b] - g.st[a]) * Math.min(Math.max(frac, 0), 1));
+  // no real geometry for this pair: follow intermediate stations of the most detailed line
   const pts = pathBetween(a, b).map(sid => STATIONS[sid]);
   if (pts.length < 2) return pts[0] ? { lat: pts[0].lat, lng: pts[0].lng } : null;
   const segLen = []; let total = 0;
@@ -204,7 +272,7 @@ function tripInfo(trip, nowMs) {
   let pos = null; const veh = rt && state.vehicles.get(rt.train + '|' + rt.line);
   if (veh && veh.lat) pos = { lat: veh.lat, lng: veh.lng, gps: true };
   else if (status === 'running' && segFrom && STATIONS[segFrom.sid] && STATIONS[segTo.sid]) {
-    const p = alongTrack(segFrom.sid, segTo.sid, frac);
+    const p = alongTrack(segFrom.sid, segTo.sid, frac, trip.line);
     if (p) pos = { ...p, gps: false };
   }
   return { rt, delayMin: Math.round(delayMs / 60000), stops, status, segFrom, segTo, frac, pos };
@@ -287,6 +355,29 @@ function render() {
 
 // ---------- map (Google Maps if key, else Leaflet/OSM) ----------
 const map = { kind: null, obj: null, markers: new Map(), ready: false };
+const DEFAULT_VIEW = { lat: 41.28, lng: 1.75, zoom: 9 };
+const USER_ZOOM = 11;
+const geo = { pos: null, asked: false };
+function inRegion(p) { return p && p.lat > 40.4 && p.lat < 42.6 && p.lng > -0.2 && p.lng < 3.4; }
+// Ask once for the device position; when it arrives (and is in Catalonia) recenter the map on it.
+function locateUser() {
+  if (geo.asked || !navigator.geolocation) return;
+  geo.asked = true;
+  navigator.geolocation.getCurrentPosition(p => {
+    geo.pos = { lat: p.coords.latitude, lng: p.coords.longitude, acc: p.coords.accuracy };
+    if (inRegion(geo.pos) && map.ready) centerOnUser();
+  }, () => {}, { maximumAge: 300000, timeout: 10000 });
+}
+function centerOnUser() {
+  if (!inRegion(geo.pos)) return;
+  if (map.kind === 'google') {
+    map.obj.setCenter(geo.pos); map.obj.setZoom(USER_ZOOM);
+    if (!map.userMk) map.userMk = new google.maps.Marker({ map: map.obj, position: geo.pos, title: 'Ets aquí', icon: { path: google.maps.SymbolPath.CIRCLE, scale: 7, fillColor: '#1a73e8', fillOpacity: 1, strokeColor: '#fff', strokeWeight: 2 } });
+  } else if (map.kind === 'leaflet') {
+    map.obj.setView([geo.pos.lat, geo.pos.lng], USER_ZOOM);
+    if (!map.userMk) map.userMk = L.circleMarker([geo.pos.lat, geo.pos.lng], { radius: 7, color: '#fff', weight: 2, fillColor: '#1a73e8', fillOpacity: 1 }).addTo(map.obj).bindTooltip('Ets aquí');
+  }
+}
 function relevantLines() {
   const o = settings.origin, d = settings.destination;
   return Object.keys(LINES).filter(k => LINES[k].stations.includes(o) && LINES[k].stations.includes(d));
@@ -296,7 +387,7 @@ function destroyMap() {
   // or the next L.map() throws "Map container is already initialized". Google has no destroy: drop refs and clear the DOM.
   if (map.kind === 'leaflet' && map.obj) map.obj.remove();
   else if (map.kind === 'google') for (const mk of map.markers.values()) mk.setMap(null);
-  map.kind = null; map.obj = null; map.ready = false; map.markers.clear();
+  map.kind = null; map.obj = null; map.userMk = null; map.ready = false; map.markers.clear();
   $('map').innerHTML = '';
 }
 function initMap() {
@@ -319,20 +410,22 @@ function loadGoogle() {
 function initGoogle(lines, allSt) {
   const g = google.maps;
   $('map').innerHTML = '';
-  const m = new g.Map($('map'), { center: { lat: 41.28, lng: 1.75 }, zoom: 9, mapTypeControl: false, streetViewControl: false });
+  const m = new g.Map($('map'), { center: { lat: DEFAULT_VIEW.lat, lng: DEFAULT_VIEW.lng }, zoom: DEFAULT_VIEW.zoom, mapTypeControl: false, streetViewControl: false });
   for (const l of lines) new g.Polyline({ path: linePath(l).map(p => ({ lat: p.lat, lng: p.lng })), strokeColor: LINES[l].color, strokeWeight: 4, strokeOpacity: .9, map: m });
   for (const s of allSt) if (STATIONS[s]) new g.Marker({ position: { lat: STATIONS[s].lat, lng: STATIONS[s].lng }, map: m, title: STATIONS[s].name, icon: { path: g.SymbolPath.CIRCLE, scale: 4, fillColor: '#fff', fillOpacity: 1, strokeColor: '#444', strokeWeight: 1.5 } });
-  map.kind = 'google'; map.obj = m; map.ready = true; $('mapInfo').textContent = '(Google Maps)';
+  map.kind = 'google'; map.obj = m; map.ready = true; $('mapInfo').textContent = '(Google Maps · traçat © OpenStreetMap)';
+  centerOnUser(); locateUser();
   updateMap(Date.now());
 }
 function initLeaflet(lines, allSt) {
   $('map').innerHTML = '';
   if (typeof L === 'undefined') { $('map').innerHTML = '<div class="muted" style="padding:12px">No s\'ha pogut carregar la llibreria de mapes (sense connexió?).</div>'; return; }
-  const m = L.map('map').setView([41.28, 1.75], 9);
+  const m = L.map('map').setView([DEFAULT_VIEW.lat, DEFAULT_VIEW.lng], DEFAULT_VIEW.zoom);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18, attribution: '© OpenStreetMap' }).addTo(m);
   for (const l of lines) L.polyline(linePath(l).map(p => [p.lat, p.lng]), { color: LINES[l].color, weight: 4, opacity: .9 }).addTo(m);
   for (const s of allSt) if (STATIONS[s]) L.circleMarker([STATIONS[s].lat, STATIONS[s].lng], { radius: 4, color: '#444', fillColor: '#fff', fillOpacity: 1, weight: 1.5 }).addTo(m).bindTooltip(STATIONS[s].name);
   map.kind = 'leaflet'; map.obj = m; map.ready = true; $('mapInfo').textContent = '(OpenStreetMap — afegeix una clau de Google Maps a Configuració)';
+  centerOnUser(); locateUser();
   updateMap(Date.now());
 }
 function updateMap(nowMs) {
@@ -364,9 +457,12 @@ function updateMap(nowMs) {
 async function refresh() {
   const now = new Date();
   const sd = serviceDay(now);
-  if (!state.sd || state.sd.y !== sd.y || state.sd.m !== sd.m || state.sd.d !== sd.d || state.sd.holiday !== settings.holiday) {
-    state.sd = { ...sd, holiday: settings.holiday };
+  if (!state.sd || state.sd.y !== sd.y || state.sd.m !== sd.m || state.sd.d !== sd.d) {
+    state.sd = { ...sd };
     state.trips = tripsForToday(sd);
+    const hn = holidayName(sd);
+    $('dayInfo').textContent = hn ? `Festiu: ${hn} (horari de diumenge)` : sd.dow === 0 ? 'Diumenge' : sd.dow === 6 ? 'Dissabte' : 'Dia feiner';
+    $('dayInfo').className = 'daytag' + (hn ? ' holiday' : '');
   }
   setStatus('actualitzant…', 'warn');
   try {
@@ -401,8 +497,7 @@ function bind() {
   $('origin').onchange = e => { settings.origin = e.target.value; saveSettings(); onRouteChange(); };
   $('destination').onchange = e => { settings.destination = e.target.value; saveSettings(); onRouteChange(); };
   $('swap').onclick = () => { [settings.origin, settings.destination] = [settings.destination, settings.origin]; $('origin').value = settings.origin; $('destination').value = settings.destination; saveSettings(); onRouteChange(); };
-  $('holiday').checked = settings.holiday; $('onlyLive').checked = settings.onlyLive;
-  $('holiday').onchange = e => { settings.holiday = e.target.checked; saveSettings(); refresh(); };
+  $('onlyLive').checked = settings.onlyLive;
   $('onlyLive').onchange = e => { settings.onlyLive = e.target.checked; saveSettings(); render(); };
   $('refresh').onclick = refresh;
   $('toggleSettings').onclick = () => { $('settings').hidden = !$('settings').hidden; };

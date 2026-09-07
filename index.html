@@ -26,7 +26,7 @@
       </label>
     </div>
     <div class="opts">
-      <label class="chk"><input type="checkbox" id="holiday"> Avui és festiu</label>
+      <span id="dayInfo" class="daytag" title="Detectat automàticament: dia de la setmana + festius de Catalunya i Barcelona"></span>
       <label class="chk"><input type="checkbox" id="onlyLive"> Només trens amb dades en directe</label>
       <button id="refresh" class="link">Actualitza ara</button>
       <button id="toggleSettings" class="link">Configuració</button>
@@ -74,13 +74,14 @@
   </section>
 
   <footer class="foot">
-    Horaris: fulls oficials Rodalies R2 (01/09/2026) i R15 (10/07/2026). Temps real: <a href="https://data.renfe.com/dataset/horarios-viaje-cercanias">Renfe Data GTFS-RT</a> (CC BY 4.0).
+    Horaris: fulls oficials Rodalies R2 (01/09/2026) i R15 (10/07/2026). Temps real: <a href="https://data.renfe.com/dataset/horarios-viaje-cercanias">Renfe Data GTFS-RT</a> (CC BY 4.0). Traçat de les vies: © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors (ODbL).
     Les hores estimades = hora programada + retard comunicat. Horaris subjectes a modificacions.
   </footer>
 </main>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
 <script src="src/data.js"></script>
+<script src="src/tracks.js"></script>
 <script src="src/app.js"></script>
 </body>
 </html>

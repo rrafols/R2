@@ -50,3 +50,6 @@ button.link{background:none;border:none;color:#0a5fb5;padding:0;text-decoration:
 .foot{font-size:11px;color:var(--muted);padding:8px 4px 20px;line-height:1.5}
 .train-icon{background:#fff;border:2px solid #333;border-radius:50%;width:14px;height:14px;box-shadow:0 0 0 2px #fff}
 @media (max-width:520px){.sel{grid-template-columns:1fr auto 1fr}.brand span{display:none}.next .big{font-size:28px}}
+
+.daytag { font-size: .9em; color: #666; align-self: center; }
+.daytag.holiday { color: #b5451b; font-weight: 600; }

@@ -15,6 +15,8 @@ Default route: Vilanova i la Geltrú → Barcelona-Sants.
 |---|---|
 | `index.html`, `style.css`, `app.js` | the app |
 | `data.js` | stations (Adif codes + coordinates), line geometry, and the full stop-time schedule extracted from the official R2 (01/09/2026) and R15 (10/07/2026) timetable PDFs |
+| `tracks.js` | real track geometry per line (polyline + chainage of each station), generated from OpenStreetMap by `tools/build_tracks.py` |
+| `tools/build_tracks.py` | regenerates `tracks.js` from the OSM Rodalies route relations (Overpass API, stdlib only) |
 | `fixture_trip_updates.json` | a fake feed for testing (`index.html?feed=fixture_trip_updates.json`) |
 
 ## Deploy on GitHub Pages
@@ -52,7 +54,8 @@ Then make sure `DEFAULT_PROXY` in `src/app.js` matches the printed URL (with `/?
 
 - **CORS.** `gtfsrt.renfe.com` sends no `Access-Control-Allow-Origin` header, so the browser cannot read the feed directly. The app therefore always fetches Renfe URLs through the Cloudflare Worker in `worker/` (see below). If the worker is unreachable the app falls back to schedule-only (status badge turns red). The *Configuració* panel lets you point at a different proxy (`https://host/?url=` format).
 - **Station codes marked `verified:false` in `data.js`** (Garraf, Gavà, Castelldefels, Segur de Calafell) were inferred from the numbering sequence. If a live R2 train at one of those stations is not matched, check the *Diagnòstic* panel: unknown stop IDs are listed there; correct the code in `data.js`.
-- The schedule is a snapshot of the printed timetables. Holidays are not auto-detected — tick *Avui és festiu*.
+- The schedule is a snapshot of the printed timetables. Sunday/holiday timetable is applied automatically on Sundays and on public holidays, computed for any year from the Catalonia calendar (fixed dates + Good Friday, Easter Monday) plus Barcelona's two local holidays (Segona Pasqua, La Mercè). Not handled: years where the Generalitat swaps or moves a holiday (e.g. a fixed date falling on Sunday being moved to Monday), and special pre-holiday services (24/31 Dec). Edit `holidaysFor()` in `app.js` if a year differs.
 - R17 south of Tarragona (Salou-Port Aventura) and Nord-side stations are not in the schedule; only the França–Sants–Vilanova–Tarragona–Riba-roja corridor is covered.
-- Line drawings on the map are straight segments between stations, not the real track.
+- Lines on the map and estimated train positions follow the real track from `tracks.js` (OSM route relations R2S, R2, R2N, R15, R17, R14, R16; ODbL). Segments not covered by an OSM relation (R15 beyond Riba-roja, R2N at Estació de França) fall back to straight lines between stations. Re-run `python3 tools/build_tracks.py` if OSM changes or you add a line; it warns about stations that sit far from the track.
+- If the browser grants geolocation and the device is in Catalonia, the map centres on the user (blue dot); otherwise it shows the default R2 Sud view.
 - The timetable sheets are the only source for stop times; Renfe's static GTFS would be more complete but is a large zip and not CORS-enabled either. If you later want that, download `stop_times.txt` once and regenerate `data.js`.
