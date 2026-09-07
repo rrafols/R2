@@ -356,26 +356,30 @@ function render() {
 // ---------- map (Google Maps if key, else Leaflet/OSM) ----------
 const map = { kind: null, obj: null, markers: new Map(), ready: false };
 const DEFAULT_VIEW = { lat: 41.28, lng: 1.75, zoom: 9 };
-const USER_ZOOM = 11;
+const ORIGIN_ZOOM = 12;
+const USER_COLOR = '#e91e63'; // magenta: distinct from every line colour and from station markers
 const geo = { pos: null, asked: false };
 function inRegion(p) { return p && p.lat > 40.4 && p.lat < 42.6 && p.lng > -0.2 && p.lng < 3.4; }
-// Ask once for the device position; when it arrives (and is in Catalonia) recenter the map on it.
+// the map view is centred on the selected origin station
+function originView() {
+  const o = STATIONS[settings.origin];
+  return o ? { lat: o.lat, lng: o.lng, zoom: ORIGIN_ZOOM } : DEFAULT_VIEW;
+}
+// Ask once for the device position; when it arrives (and is in Catalonia) show it as a marker. The view is not moved.
 function locateUser() {
   if (geo.asked || !navigator.geolocation) return;
   geo.asked = true;
   navigator.geolocation.getCurrentPosition(p => {
     geo.pos = { lat: p.coords.latitude, lng: p.coords.longitude, acc: p.coords.accuracy };
-    if (inRegion(geo.pos) && map.ready) centerOnUser();
+    if (map.ready) showUser();
   }, () => {}, { maximumAge: 300000, timeout: 10000 });
 }
-function centerOnUser() {
-  if (!inRegion(geo.pos)) return;
+function showUser() {
+  if (!inRegion(geo.pos) || map.userMk) return;
   if (map.kind === 'google') {
-    map.obj.setCenter(geo.pos); map.obj.setZoom(USER_ZOOM);
-    if (!map.userMk) map.userMk = new google.maps.Marker({ map: map.obj, position: geo.pos, title: 'Ets aquí', icon: { path: google.maps.SymbolPath.CIRCLE, scale: 7, fillColor: '#1a73e8', fillOpacity: 1, strokeColor: '#fff', strokeWeight: 2 } });
+    map.userMk = new google.maps.Marker({ map: map.obj, position: geo.pos, title: 'La teva ubicació', zIndex: 1000, icon: { path: google.maps.SymbolPath.CIRCLE, scale: 8, fillColor: USER_COLOR, fillOpacity: 1, strokeColor: '#fff', strokeWeight: 2.5 } });
   } else if (map.kind === 'leaflet') {
-    map.obj.setView([geo.pos.lat, geo.pos.lng], USER_ZOOM);
-    if (!map.userMk) map.userMk = L.circleMarker([geo.pos.lat, geo.pos.lng], { radius: 7, color: '#fff', weight: 2, fillColor: '#1a73e8', fillOpacity: 1 }).addTo(map.obj).bindTooltip('Ets aquí');
+    map.userMk = L.circleMarker([geo.pos.lat, geo.pos.lng], { radius: 8, color: '#fff', weight: 2.5, fillColor: USER_COLOR, fillOpacity: 1, pane: 'markerPane' }).addTo(map.obj).bindTooltip('La teva ubicació');
   }
 }
 function relevantLines() {
@@ -394,7 +398,7 @@ function initMap() {
   destroyMap();
   const lines = relevantLines().length ? relevantLines() : ['R2S', 'R15'];
   const allSt = new Set(lines.flatMap(l => LINES[l].stations));
-  $('legend').innerHTML = lines.map(l => `<span><i style="background:${LINES[l].color}"></i>${LINES[l].name}</span>`).join('') + '<span><i style="background:#333;height:10px;width:10px;border-radius:50%"></i>tren (GPS) </span><span><i style="background:#fff;border:2px solid #333;height:8px;width:8px;border-radius:50%"></i>tren (estimat per horari)</span>';
+  $('legend').innerHTML = lines.map(l => `<span><i style="background:${LINES[l].color}"></i>${LINES[l].name}</span>`).join('') + '<span><i style="background:#333;height:10px;width:10px;border-radius:50%"></i>tren (GPS) </span><span><i style="background:#fff;border:2px solid #333;height:8px;width:8px;border-radius:50%"></i>tren (estimat per horari)</span><span><i style="background:' + USER_COLOR + ';border:2px solid #fff;box-shadow:0 0 0 1px #999;height:10px;width:10px;border-radius:50%"></i>la teva ubicació</span>';
   if (settings.gmapsKey && window.google?.maps) initGoogle(lines, allSt);
   else if (settings.gmapsKey) loadGoogle().then(() => initGoogle(lines, allSt)).catch(() => initLeaflet(lines, allSt));
   else initLeaflet(lines, allSt);
@@ -410,22 +414,24 @@ function loadGoogle() {
 function initGoogle(lines, allSt) {
   const g = google.maps;
   $('map').innerHTML = '';
-  const m = new g.Map($('map'), { center: { lat: DEFAULT_VIEW.lat, lng: DEFAULT_VIEW.lng }, zoom: DEFAULT_VIEW.zoom, mapTypeControl: false, streetViewControl: false });
+  const v = originView();
+  const m = new g.Map($('map'), { center: { lat: v.lat, lng: v.lng }, zoom: v.zoom, mapTypeControl: false, streetViewControl: false });
   for (const l of lines) new g.Polyline({ path: linePath(l).map(p => ({ lat: p.lat, lng: p.lng })), strokeColor: LINES[l].color, strokeWeight: 4, strokeOpacity: .9, map: m });
   for (const s of allSt) if (STATIONS[s]) new g.Marker({ position: { lat: STATIONS[s].lat, lng: STATIONS[s].lng }, map: m, title: STATIONS[s].name, icon: { path: g.SymbolPath.CIRCLE, scale: 4, fillColor: '#fff', fillOpacity: 1, strokeColor: '#444', strokeWeight: 1.5 } });
   map.kind = 'google'; map.obj = m; map.ready = true; $('mapInfo').textContent = '(Google Maps · traçat © OpenStreetMap)';
-  centerOnUser(); locateUser();
+  showUser(); locateUser();
   updateMap(Date.now());
 }
 function initLeaflet(lines, allSt) {
   $('map').innerHTML = '';
   if (typeof L === 'undefined') { $('map').innerHTML = '<div class="muted" style="padding:12px">No s\'ha pogut carregar la llibreria de mapes (sense connexió?).</div>'; return; }
-  const m = L.map('map').setView([DEFAULT_VIEW.lat, DEFAULT_VIEW.lng], DEFAULT_VIEW.zoom);
+  const v = originView();
+  const m = L.map('map').setView([v.lat, v.lng], v.zoom);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18, attribution: '© OpenStreetMap' }).addTo(m);
   for (const l of lines) L.polyline(linePath(l).map(p => [p.lat, p.lng]), { color: LINES[l].color, weight: 4, opacity: .9 }).addTo(m);
   for (const s of allSt) if (STATIONS[s]) L.circleMarker([STATIONS[s].lat, STATIONS[s].lng], { radius: 4, color: '#444', fillColor: '#fff', fillOpacity: 1, weight: 1.5 }).addTo(m).bindTooltip(STATIONS[s].name);
   map.kind = 'leaflet'; map.obj = m; map.ready = true; $('mapInfo').textContent = '(OpenStreetMap — afegeix una clau de Google Maps a Configuració)';
-  centerOnUser(); locateUser();
+  showUser(); locateUser();
   updateMap(Date.now());
 }
 function updateMap(nowMs) {
