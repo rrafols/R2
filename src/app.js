@@ -243,7 +243,16 @@ function relevantLines() {
   const o = settings.origin, d = settings.destination;
   return Object.keys(LINES).filter(k => LINES[k].stations.includes(o) && LINES[k].stations.includes(d));
 }
+function destroyMap() {
+  // Leaflet marks the container with _leaflet_id; clearing innerHTML is not enough, remove() is required
+  // or the next L.map() throws "Map container is already initialized". Google has no destroy: drop refs and clear the DOM.
+  if (map.kind === 'leaflet' && map.obj) map.obj.remove();
+  else if (map.kind === 'google') for (const mk of map.markers.values()) mk.setMap(null);
+  map.kind = null; map.obj = null; map.ready = false; map.markers.clear();
+  $('map').innerHTML = '';
+}
 function initMap() {
+  destroyMap();
   const lines = relevantLines().length ? relevantLines() : ['R2S', 'R15'];
   const allSt = new Set(lines.flatMap(l => LINES[l].stations));
   $('legend').innerHTML = lines.map(l => `<span><i style="background:${LINES[l].color}"></i>${LINES[l].name}</span>`).join('') + '<span><i style="background:#333;height:10px;width:10px;border-radius:50%"></i>tren (GPS) </span><span><i style="background:#fff;border:2px solid #333;height:8px;width:8px;border-radius:50%"></i>tren (estimat per horari)</span>';
@@ -352,7 +361,7 @@ function bind() {
   $('gmapsKey').value = settings.gmapsKey; $('proxy').value = settings.proxy; $('feedUrl').value = settings.feedUrl;
   $('saveSettings').onclick = () => {
     settings.gmapsKey = $('gmapsKey').value.trim(); settings.proxy = $('proxy').value.trim(); settings.feedUrl = $('feedUrl').value.trim() || FEED_TU;
-    saveSettings(); $('settings').hidden = true; map.ready = false; map.markers.clear(); initMap(); refresh();
+    saveSettings(); $('settings').hidden = true; initMap(); refresh();
   };
   $('resetSettings').onclick = () => { localStorage.removeItem('rodalies-live'); location.reload(); };
   const qs = new URLSearchParams(location.search);
@@ -360,7 +369,7 @@ function bind() {
   if (qs.get('from') && STATIONS[qs.get('from')]) settings.origin = qs.get('from');
   if (qs.get('to') && STATIONS[qs.get('to')]) settings.destination = qs.get('to');
 }
-function onRouteChange() { map.ready = false; for (const mk of map.markers.values()) map.kind === 'google' ? mk.setMap(null) : mk.remove(); map.markers.clear(); initMap(); render(); }
+function onRouteChange() { initMap(); render(); }
 
 fillStations(); bind(); $('origin').value = settings.origin; $('destination').value = settings.destination;
 initMap(); refresh();
