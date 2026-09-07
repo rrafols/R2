@@ -14,6 +14,8 @@ const FEED_VP = 'https://gtfsrt.renfe.com/vehicle_positions.json';
 const DEFAULT_PROXY = 'https://rodalies-proxy.raimon-rafols.workers.dev/?url=';
 const DEFAULTS = { origin: '71700', destination: '71801', onlyLive: false, gmapsKey: '', proxy: '', feedUrl: FEED_TU };
 const REFRESH_MS = 30000;
+const MIN_UPCOMING = 5;       // always try to show at least this many upcoming trains…
+const MAX_LOOKAHEAD_DAYS = 7; // …searching up to this many service days ahead
 const R2_FAMILY = new Set(['R2', 'R2S', 'R2N']);
 
 const $ = id => document.getElementById(id);
@@ -90,13 +92,37 @@ function dayTags(sd) {
 }
 
 // ---------- schedule ----------
-function tripsForToday(sd) {
+function nextServiceDay(sd) {
+  const q = madrid(new Date(Date.UTC(sd.y, sd.m - 1, sd.d, 12) + 86400000));
+  return { y: q.y, m: q.m, d: q.d, dow: q.dow, nowMin: 0 };
+}
+// Trips of one service day. dayOffset 0 = the current service day; 1, 2… = following days, each with its own
+// timetable type (weekday / Saturday / Sunday-or-holiday), so the search for the next train crosses day boundaries correctly.
+function tripsForDay(sd, dayOffset = 0) {
   const tags = dayTags(sd);
   return SCHEDULE.filter(t => tags.has(t.days)).map((t, i) => ({
-    id: `${t.line}-${t.train || 's' + i}-${t.stops[0][1]}`,
+    id: `${t.line}-${t.train || 's' + i}-${t.stops[0][1]}${dayOffset ? '@+' + dayOffset : ''}`, // distinct id: live data only attaches to today's copy
+    dayOffset, sd,
     line: t.line, train: t.train, type: t.type, src: t.src,
     stops: t.stops.map(([sid, time]) => ({ sid, min: hm(time), sched: epochOf(sd.y, sd.m, sd.d, hm(time)) })),
   }));
+}
+// trips for the service day `offset` days after the current one (computed lazily, cached until the day changes)
+function dayTrips(offset) {
+  while (state.days.length <= offset) {
+    const prev = state.days[state.days.length - 1].sd, sd = nextServiceDay(prev);
+    state.days.push({ sd, trips: tripsForDay(sd, state.days.length) });
+  }
+  return state.days[offset].trips;
+}
+const DOW_CA = ['diumenge', 'dilluns', 'dimarts', 'dimecres', 'dijous', 'divendres', 'dissabte'];
+function dayLabel(trip) { // '' if the trip runs on the current calendar date, 'demà', or e.g. 'dijous 10/9'; '(festiu)' when that day uses the holiday timetable
+  if (!trip.dayOffset) return '';
+  const today = madrid(new Date()), sd = trip.sd;
+  const daysAhead = Math.round((Date.UTC(sd.y, sd.m - 1, sd.d) - Date.UTC(today.y, today.m - 1, today.d)) / 86400000);
+  if (daysAhead <= 0) return holidayName(sd) ? 'avui (festiu)' : ''; // e.g. 01:00 → service day is still yesterday, but the 04:45 train is today
+  const base = daysAhead === 1 ? 'demà' : `${DOW_CA[sd.dow]} ${sd.d}/${sd.m}`;
+  return holidayName(sd) ? `${base} (festiu)` : base;
 }
 function stopIndex(trip, sid) { return trip.stops.findIndex(s => s.sid === sid); }
 
@@ -122,7 +148,7 @@ async function fetchJson(url) {
   throw lastErr || new Error('fetch failed');
 }
 
-const state = { trips: [], live: new Map(), vehicles: new Map(), unmatched: [], unknownStops: new Set(), lastOk: null, error: null, sd: null };
+const state = { trips: [], days: [], live: new Map(), vehicles: new Map(), unmatched: [], unknownStops: new Set(), lastOk: null, error: null, sd: null };
 
 function matchRealtime(tuFeed, vpFeed) {
   const sd = state.sd;
@@ -289,6 +315,7 @@ function delayChip(info) {
   return `<span class="delay ${d > 0 ? 'late' : 'ok'}">${d > 0 ? '+' : ''}${d} min</span>`;
 }
 function whereText(info, trip) {
+  if (trip.dayOffset) { const l = dayLabel(trip); return `${l[0].toUpperCase() + l.slice(1)}, surt de ${stationName(trip.stops[0].sid)} a les ${fmtHM(info.stops[0].eta)}`; }
   if (info.status === 'notstarted') return `Encara no ha sortit de ${stationName(trip.stops[0].sid)}`;
   if (info.status === 'finished') return `Ha arribat a ${stationName(trip.stops[trip.stops.length - 1].sid)}`;
   if (info.status === 'cancelled') return 'Servei cancel·lat';
@@ -300,28 +327,40 @@ function whereText(info, trip) {
 function render() {
   const nowMs = Date.now();
   const o = settings.origin, d = settings.destination;
-  const rows = [];
-  for (const trip of state.trips) {
-    const io = stopIndex(trip, o), id = stopIndex(trip, d);
-    if (io < 0 || id < 0 || io >= id) continue;
-    const info = tripInfo(trip, nowMs);
-    if (settings.onlyLive && !info.rt) continue;
-    const etaO = info.stops[io].eta, etaD = info.stops[id].eta;
-    if (etaO < nowMs - 20 * 60000) continue;           // keep a short history
-    rows.push({ trip, info, io, id, etaO, etaD });
+  const collect = trips => {
+    const out = [];
+    for (const trip of trips) {
+      const io = stopIndex(trip, o), id = stopIndex(trip, d);
+      if (io < 0 || id < 0 || io >= id) continue;
+      const info = tripInfo(trip, nowMs);
+      if (settings.onlyLive && !info.rt) continue;
+      const etaO = info.stops[io].eta, etaD = info.stops[id].eta;
+      if (etaO < nowMs - 20 * 60000) continue;           // keep a short history
+      out.push({ trip, info, io, id, etaO, etaD });
+    }
+    return out.sort((a, b) => a.etaO - b.etaO);
+  };
+  const rows = collect(state.trips);
+  let upcoming = rows.filter(r => r.etaO >= nowMs - 30000).length;
+  // not enough trains left today: keep looking on the following service days (each with its own timetable type)
+  for (let off = 1; off <= MAX_LOOKAHEAD_DAYS && upcoming < MIN_UPCOMING; off++) {
+    const more = collect(dayTrips(off)).slice(0, MIN_UPCOMING - upcoming);
+    rows.push(...more); upcoming += more.length;
   }
-  rows.sort((a, b) => a.etaO - b.etaO);
   const nextIdx = rows.findIndex(r => r.etaO >= nowMs - 30000 && r.info.status !== 'cancelled');
 
   // next-train card
   const nc = $('nextCard');
-  if (nextIdx < 0) nc.innerHTML = `<div class="muted">No queden trens ${stationName(o)} → ${stationName(d)} avui amb l'horari carregat.</div>`;
+  if (o === d) nc.innerHTML = '<div class="muted">Tria dues estacions diferents.</div>';
+  else if (nextIdx < 0) nc.innerHTML = `<div class="muted">Cap tren ${stationName(o)} → ${stationName(d)} a l'horari carregat.</div>`;
   else {
     const r = rows[nextIdx]; const mins = Math.max(0, Math.round((r.etaO - nowMs) / 60000));
     const sO = r.info.stops[r.io], sD = r.info.stops[r.id];
+    const lbl = dayLabel(r.trip);
+    const when = lbl ? `${lbl} <span class="small">${fmtHM(r.etaO)}</span>` : mins >= 180 ? `a les ${fmtHM(r.etaO)}` : `${mins === 0 ? 'ara' : 'en ' + mins + ' min'} <span class="small">${fmtHM(r.etaO)}</span>`;
     nc.innerHTML = `
       <div class="muted small">Proper tren · ${stationName(o)} → ${stationName(d)}</div>
-      <div class="big">${mins === 0 ? 'ara' : 'en ' + mins + ' min'} <span class="small">${fmtHM(r.etaO)}</span></div>
+      <div class="big">${when}</div>
       <div class="eta">${badge(r.trip.line)} ${r.trip.train ? '<span class="muted">' + r.trip.train + '</span>' : ''}
         arribada estimada a ${stationName(d)}: <b>${fmtHM(r.etaD)}</b>
         ${r.info.delayMin ? `<span class="muted small">(programat ${fmtHM(sD.sched)})</span>` : ''} ${delayChip(r.info)}</div>
@@ -332,8 +371,9 @@ function render() {
   $('listTitle').textContent = `Trens ${stationName(o)} → ${stationName(d)}`;
   $('list').innerHTML = rows.slice(0, 40).map((r, i) => {
     const sO = r.info.stops[r.io];
-    const cls = ['trip', i === nextIdx ? 'next' : '', r.info.rt ? 'live' : '', r.etaO < nowMs - 30000 ? 'past' : ''].join(' ');
-    const dep = r.info.delayMin ? `<span class="strike small">${fmtHM(sO.sched)}</span> <b>${fmtHM(r.etaO)}</b>` : `<b>${fmtHM(r.etaO)}</b>`;
+    const cls = ['trip', i === nextIdx ? 'next' : '', r.info.rt ? 'live' : '', r.etaO < nowMs - 30000 ? 'past' : '', r.trip.dayOffset ? 'tomorrow' : ''].join(' ');
+    const lbl = dayLabel(r.trip);
+    const dep = (lbl ? `<span class="tag">${lbl}</span> ` : '') + (r.info.delayMin ? `<span class="strike small">${fmtHM(sO.sched)}</span> <b>${fmtHM(r.etaO)}</b>` : `<b>${fmtHM(r.etaO)}</b>`);
     return `<div class="${cls}">
       <div>${badge(r.trip.line)}<div class="muted small">${r.trip.train || ''} ${r.trip.type || ''}</div></div>
       <div>${delayChip(r.info)} <span class="muted small">→ ${stationName(r.trip.stops[r.trip.stops.length - 1].sid)}</span></div>
@@ -465,7 +505,8 @@ async function refresh() {
   const sd = serviceDay(now);
   if (!state.sd || state.sd.y !== sd.y || state.sd.m !== sd.m || state.sd.d !== sd.d) {
     state.sd = { ...sd };
-    state.trips = tripsForToday(sd);
+    state.trips = tripsForDay(sd);
+    state.days = [{ sd, trips: state.trips }]; // later days are generated on demand by dayTrips()
     const hn = holidayName(sd);
     $('dayInfo').textContent = hn ? `Festiu: ${hn} (horari de diumenge)` : sd.dow === 0 ? 'Diumenge' : sd.dow === 6 ? 'Dissabte' : 'Dia feiner';
     $('dayInfo').className = 'daytag' + (hn ? ' holiday' : '');
@@ -500,8 +541,9 @@ function fillStations() {
   $('origin').value = settings.origin; $('destination').value = settings.destination;
 }
 function bind() {
-  $('origin').onchange = e => { settings.origin = e.target.value; saveSettings(); onRouteChange(); };
-  $('destination').onchange = e => { settings.destination = e.target.value; saveSettings(); onRouteChange(); };
+  // picking the station already selected on the other side swaps the trip instead of producing X → X
+  $('origin').onchange = e => { if (e.target.value === settings.destination) { settings.destination = settings.origin; $('destination').value = settings.destination; } settings.origin = e.target.value; saveSettings(); onRouteChange(); };
+  $('destination').onchange = e => { if (e.target.value === settings.origin) { settings.origin = settings.destination; $('origin').value = settings.origin; } settings.destination = e.target.value; saveSettings(); onRouteChange(); };
   $('swap').onclick = () => { [settings.origin, settings.destination] = [settings.destination, settings.origin]; $('origin').value = settings.origin; $('destination').value = settings.destination; saveSettings(); onRouteChange(); };
   $('onlyLive').checked = settings.onlyLive;
   $('onlyLive').onchange = e => { settings.onlyLive = e.target.checked; saveSettings(); render(); };
