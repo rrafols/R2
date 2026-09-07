@@ -315,7 +315,7 @@ function delayChip(info) {
   return `<span class="delay ${d > 0 ? 'late' : 'ok'}">${d > 0 ? '+' : ''}${d} min</span>`;
 }
 function whereText(info, trip) {
-  if (trip.dayOffset) { const l = dayLabel(trip); return `${l[0].toUpperCase() + l.slice(1)}, surt de ${stationName(trip.stops[0].sid)} a les ${fmtHM(info.stops[0].eta)}`; }
+  if (trip.dayOffset) { const l = dayLabel(trip) || 'avui'; return `${l[0].toUpperCase() + l.slice(1)}, surt de ${stationName(trip.stops[0].sid)} a les ${fmtHM(info.stops[0].eta)}`; }
   if (info.status === 'notstarted') return `Encara no ha sortit de ${stationName(trip.stops[0].sid)}`;
   if (info.status === 'finished') return `Ha arribat a ${stationName(trip.stops[trip.stops.length - 1].sid)}`;
   if (info.status === 'cancelled') return 'Servei cancel·lat';
