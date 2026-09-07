@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="ca">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rodalies en directe · R2 Sud / R15 / R17</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="rlogo">R</div>
+  <div class="brand"><b>Rodalies en directe</b><span>R2 Sud · R15 · R17 · dades GTFS-RT de Renfe</span></div>
+  <div class="status" id="status" title="Estat de la connexió">…</div>
+</header>
+
+<main>
+  <section class="route card">
+    <div class="sel">
+      <label>Origen
+        <select id="origin"></select>
+      </label>
+      <button id="swap" class="swap" title="Canviar sentit (viatge de tornada)" aria-label="Canviar sentit">⇄</button>
+      <label>Destinació
+        <select id="destination"></select>
+      </label>
+    </div>
+    <div class="opts">
+      <label class="chk"><input type="checkbox" id="holiday"> Avui és festiu</label>
+      <label class="chk"><input type="checkbox" id="onlyLive"> Només trens amb dades en directe</label>
+      <button id="refresh" class="link">Actualitza ara</button>
+      <button id="toggleSettings" class="link">Configuració</button>
+    </div>
+  </section>
+
+  <section id="settings" class="card settings" hidden>
+    <h2>Configuració</h2>
+    <label>Clau API de Google Maps (opcional; sense clau s'usa OpenStreetMap)
+      <input id="gmapsKey" type="text" placeholder="AIza…" autocomplete="off">
+    </label>
+    <label>Proxy CORS (opcional, per si el navegador bloqueja gtfsrt.renfe.com)
+      <input id="proxy" type="text" placeholder="https://el-teu-proxy/?url=">
+    </label>
+    <label>URL del feed (per proves pots apuntar a un fitxer JSON local)
+      <input id="feedUrl" type="text">
+    </label>
+    <div class="row">
+      <button id="saveSettings">Desa</button>
+      <button id="resetSettings" class="link">Restableix</button>
+    </div>
+    <p class="hint">La clau i el proxy es desen només al teu navegador (localStorage).</p>
+  </section>
+
+  <section class="card next" id="nextCard">
+    <div class="muted">Carregant horaris…</div>
+  </section>
+
+  <section class="card">
+    <h2 id="listTitle">Propers trens</h2>
+    <div id="list" class="list"></div>
+  </section>
+
+  <section class="card mapcard">
+    <h2>Mapa <span class="muted small" id="mapInfo"></span></h2>
+    <div id="map"></div>
+    <div class="legend" id="legend"></div>
+  </section>
+
+  <section class="card diag">
+    <details>
+      <summary>Diagnòstic (trens en directe no identificats, codis d'estació desconeguts)</summary>
+      <pre id="diag"></pre>
+    </details>
+  </section>
+
+  <footer class="foot">
+    Horaris: fulls oficials Rodalies R2 (01/09/2026) i R15 (10/07/2026). Temps real: <a href="https://data.renfe.com/dataset/horarios-viaje-cercanias">Renfe Data GTFS-RT</a> (CC BY 4.0).
+    Les hores estimades = hora programada + retard comunicat. Horaris subjectes a modificacions.
+  </footer>
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script src="src/data.js"></script>
+<script src="src/app.js"></script>
+</body>
+</html>
