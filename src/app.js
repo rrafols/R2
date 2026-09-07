@@ -134,6 +134,54 @@ function matchRealtime(tuFeed, vpFeed) {
 }
 
 // ETA / position for a trip
+// ---------- track geometry ----------
+// Lines are stored as stop lists, so an express line (R15 Sants→Vilanova) would draw/interpolate as a straight
+// line even though it runs on the R2 Sud track. Expand each station pair through the line that has the most
+// intermediate stations between them, so express services follow the local-line geometry.
+const pathCache = new Map();
+function pathBetween(a, b) {
+  const key = a + '>' + b;
+  if (pathCache.has(key)) return pathCache.get(key);
+  let best = [a, b];
+  for (const l of Object.values(LINES)) {
+    const ia = l.stations.indexOf(a), ib = l.stations.indexOf(b);
+    if (ia < 0 || ib < 0) continue;
+    const seg = ia <= ib ? l.stations.slice(ia, ib + 1) : l.stations.slice(ib, ia + 1).reverse();
+    if (seg.length > best.length) best = seg;
+  }
+  best = best.filter(sid => STATIONS[sid]);
+  pathCache.set(key, best);
+  return best;
+}
+function linePath(line) {
+  const st = LINES[line].stations, out = [];
+  for (let i = 0; i < st.length - 1; i++) {
+    const seg = pathBetween(st[i], st[i + 1]);
+    for (const sid of (out.length ? seg.slice(1) : seg)) out.push(STATIONS[sid]);
+  }
+  return out;
+}
+function dist(p, q) { // equirectangular approximation, good enough at this scale
+  const kx = Math.cos((p.lat + q.lat) / 2 * Math.PI / 180);
+  return Math.hypot((p.lat - q.lat), (p.lng - q.lng) * kx);
+}
+// position at fraction `frac` of the track length between station a and station b
+function alongTrack(a, b, frac) {
+  const pts = pathBetween(a, b).map(sid => STATIONS[sid]);
+  if (pts.length < 2) return pts[0] ? { lat: pts[0].lat, lng: pts[0].lng } : null;
+  const segLen = []; let total = 0;
+  for (let i = 0; i < pts.length - 1; i++) { const d = dist(pts[i], pts[i + 1]); segLen.push(d); total += d; }
+  let target = Math.min(Math.max(frac, 0), 1) * total;
+  for (let i = 0; i < segLen.length; i++) {
+    if (target <= segLen[i] || i === segLen.length - 1) {
+      const f = segLen[i] ? target / segLen[i] : 0, p = pts[i], q = pts[i + 1];
+      return { lat: p.lat + (q.lat - p.lat) * f, lng: p.lng + (q.lng - p.lng) * f };
+    }
+    target -= segLen[i];
+  }
+  return { lat: pts[pts.length - 1].lat, lng: pts[pts.length - 1].lng };
+}
+
 function tripInfo(trip, nowMs) {
   const rt = state.live.get(trip.id);
   const delayMs = rt ? rt.delaySec * 1000 : 0;
@@ -156,8 +204,8 @@ function tripInfo(trip, nowMs) {
   let pos = null; const veh = rt && state.vehicles.get(rt.train + '|' + rt.line);
   if (veh && veh.lat) pos = { lat: veh.lat, lng: veh.lng, gps: true };
   else if (status === 'running' && segFrom && STATIONS[segFrom.sid] && STATIONS[segTo.sid]) {
-    const a = STATIONS[segFrom.sid], b = STATIONS[segTo.sid];
-    pos = { lat: a.lat + (b.lat - a.lat) * frac, lng: a.lng + (b.lng - a.lng) * frac, gps: false };
+    const p = alongTrack(segFrom.sid, segTo.sid, frac);
+    if (p) pos = { ...p, gps: false };
   }
   return { rt, delayMin: Math.round(delayMs / 60000), stops, status, segFrom, segTo, frac, pos };
 }
@@ -272,7 +320,7 @@ function initGoogle(lines, allSt) {
   const g = google.maps;
   $('map').innerHTML = '';
   const m = new g.Map($('map'), { center: { lat: 41.28, lng: 1.75 }, zoom: 9, mapTypeControl: false, streetViewControl: false });
-  for (const l of lines) new g.Polyline({ path: LINES[l].stations.filter(s => STATIONS[s]).map(s => ({ lat: STATIONS[s].lat, lng: STATIONS[s].lng })), strokeColor: LINES[l].color, strokeWeight: 4, strokeOpacity: .9, map: m });
+  for (const l of lines) new g.Polyline({ path: linePath(l).map(p => ({ lat: p.lat, lng: p.lng })), strokeColor: LINES[l].color, strokeWeight: 4, strokeOpacity: .9, map: m });
   for (const s of allSt) if (STATIONS[s]) new g.Marker({ position: { lat: STATIONS[s].lat, lng: STATIONS[s].lng }, map: m, title: STATIONS[s].name, icon: { path: g.SymbolPath.CIRCLE, scale: 4, fillColor: '#fff', fillOpacity: 1, strokeColor: '#444', strokeWeight: 1.5 } });
   map.kind = 'google'; map.obj = m; map.ready = true; $('mapInfo').textContent = '(Google Maps)';
   updateMap(Date.now());
@@ -282,7 +330,7 @@ function initLeaflet(lines, allSt) {
   if (typeof L === 'undefined') { $('map').innerHTML = '<div class="muted" style="padding:12px">No s\'ha pogut carregar la llibreria de mapes (sense connexió?).</div>'; return; }
   const m = L.map('map').setView([41.28, 1.75], 9);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 18, attribution: '© OpenStreetMap' }).addTo(m);
-  for (const l of lines) L.polyline(LINES[l].stations.filter(s => STATIONS[s]).map(s => [STATIONS[s].lat, STATIONS[s].lng]), { color: LINES[l].color, weight: 4, opacity: .9 }).addTo(m);
+  for (const l of lines) L.polyline(linePath(l).map(p => [p.lat, p.lng]), { color: LINES[l].color, weight: 4, opacity: .9 }).addTo(m);
   for (const s of allSt) if (STATIONS[s]) L.circleMarker([STATIONS[s].lat, STATIONS[s].lng], { radius: 4, color: '#444', fillColor: '#fff', fillOpacity: 1, weight: 1.5 }).addTo(m).bindTooltip(STATIONS[s].name);
   map.kind = 'leaflet'; map.obj = m; map.ready = true; $('mapInfo').textContent = '(OpenStreetMap — afegeix una clau de Google Maps a Configuració)';
   updateMap(Date.now());
