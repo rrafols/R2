@@ -9,6 +9,9 @@
 const TZ = 'Europe/Madrid';
 const FEED_TU = 'https://gtfsrt.renfe.com/trip_updates.json';
 const FEED_VP = 'https://gtfsrt.renfe.com/vehicle_positions.json';
+// gtfsrt.renfe.com sends no Access-Control-Allow-Origin header, so the browser cannot read it directly.
+// Renfe URLs are always fetched through this relay (see worker/worker.js); the Configuració field overrides it.
+const DEFAULT_PROXY = 'https://rodalies-proxy.raimon-rafols.workers.dev/?url=';
 const DEFAULTS = { origin: '71700', destination: '71801', holiday: false, onlyLive: false, gmapsKey: '', proxy: '', feedUrl: FEED_TU };
 const REFRESH_MS = 30000;
 const R2_FAMILY = new Set(['R2', 'R2S', 'R2N']);
@@ -70,9 +73,12 @@ function parseTripId(id) {
   const m = /^\d{4}J(\d{4,6})([A-Za-z]+\d*[A-Za-z]*)$/.exec(id || '');
   return m ? { train: m[1], line: m[2].toUpperCase() } : null;
 }
+function needsProxy(url) { return /^https?:\/\/gtfsrt\.renfe\.com\//.test(url); }
 async function fetchJson(url) {
-  const tryUrls = [url];
-  if (settings.proxy) tryUrls.push(settings.proxy + encodeURIComponent(url));
+  const proxy = settings.proxy || DEFAULT_PROXY;
+  // Renfe's feed always fails CORS when fetched directly, so don't waste a request on it: go via the relay.
+  // Local/fixture URLs are fetched as-is.
+  const tryUrls = needsProxy(url) && proxy ? [proxy + encodeURIComponent(url)] : [url];
   let lastErr;
   for (const u of tryUrls) {
     try {

@@ -38,8 +38,8 @@
     <label>Clau API de Google Maps (opcional; sense clau s'usa OpenStreetMap)
       <input id="gmapsKey" type="text" placeholder="AIza…" autocomplete="off">
     </label>
-    <label>Proxy CORS (opcional, per si el navegador bloqueja gtfsrt.renfe.com)
-      <input id="proxy" type="text" placeholder="https://el-teu-proxy/?url=">
+    <label>Proxy CORS (opcional; per defecte s'usa el worker de <code>worker/</code>, gtfsrt.renfe.com no permet peticions directes des del navegador)
+      <input id="proxy" type="text" placeholder="https://rodalies-proxy.raimon-rafols.workers.dev/?url=">
     </label>
     <label>URL del feed (per proves pots apuntar a un fitxer JSON local)
       <input id="feedUrl" type="text">
