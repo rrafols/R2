@@ -353,6 +353,8 @@ function render() {
 
   // next-train card
   const nc = $('nextCard');
+  nc.dataset.id = nextIdx >= 0 ? rows[nextIdx].trip.id : '';
+  nc.classList.toggle('clickable', nextIdx >= 0);
   if (o === d) nc.innerHTML = '<div class="muted">Tria dues estacions diferents.</div>';
   else if (nextIdx < 0) nc.innerHTML = `<div class="muted">Cap tren ${stationName(o)} → ${stationName(d)} a l'horari carregat.</div>`;
   else {
@@ -589,6 +591,7 @@ function bind() {
   $('onlyLive').onchange = e => { settings.onlyLive = e.target.checked; saveSettings(); render(); };
   $('refresh').onclick = refresh;
   $('list').onclick = e => { const row = e.target.closest('.trip'); if (row?.dataset.id) focusTrain(row.dataset.id); };
+  $('nextCard').onclick = () => { const id = $('nextCard').dataset.id; if (id) focusTrain(id); };
   $('toggleSettings').onclick = () => { $('settings').hidden = !$('settings').hidden; };
   $('gmapsKey').value = settings.gmapsKey; $('proxy').value = settings.proxy; $('feedUrl').value = settings.feedUrl;
   $('saveSettings').onclick = () => {

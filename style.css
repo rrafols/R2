@@ -38,6 +38,8 @@ button.link{background:none;border:none;color:#0a5fb5;padding:0;text-decoration:
 .trip:hover{background:#f3f6f9}
 .trip.next{background:var(--next)}
 .trip.sel{outline:2px solid var(--orange);outline-offset:-2px}
+.next.clickable{cursor:pointer}
+.next.clickable:hover{filter:brightness(.97)}
 .trip.live{border-left:4px solid #1e88c7}
 .trip.past{opacity:.45}
 .trip .times{font-variant-numeric:tabular-nums;font-size:16px;text-align:right;white-space:nowrap}
