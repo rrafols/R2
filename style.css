@@ -34,7 +34,10 @@ button.link{background:none;border:none;color:#0a5fb5;padding:0;text-decoration:
 .list{display:flex;flex-direction:column;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}
 .listmore{text-align:center;padding-top:6px}
 .trip{display:grid;grid-template-columns:52px 1fr auto;gap:4px 10px;padding:8px 6px;border-bottom:1px solid var(--rule);align-items:center}
+.trip{cursor:pointer}
+.trip:hover{background:#f3f6f9}
 .trip.next{background:var(--next)}
+.trip.sel{outline:2px solid var(--orange);outline-offset:-2px}
 .trip.live{border-left:4px solid #1e88c7}
 .trip.past{opacity:.45}
 .trip .times{font-variant-numeric:tabular-nums;font-size:16px;text-align:right;white-space:nowrap}

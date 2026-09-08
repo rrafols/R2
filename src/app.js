@@ -149,7 +149,7 @@ async function fetchJson(url) {
   throw lastErr || new Error('fetch failed');
 }
 
-const state = { trips: [], days: [], live: new Map(), vehicles: new Map(), unmatched: [], unknownStops: new Set(), lastOk: null, error: null, sd: null };
+const state = { selectedId: null, trips: [], days: [], live: new Map(), vehicles: new Map(), unmatched: [], unknownStops: new Set(), lastOk: null, error: null, sd: null };
 
 function matchRealtime(tuFeed, vpFeed) {
   const sd = state.sd;
@@ -373,10 +373,10 @@ function render() {
   $('listTitle').textContent = `Trens ${stationName(o)} → ${stationName(d)}`;
   $('list').innerHTML = rows.slice(0, 40).map((r, i) => {
     const sO = r.info.stops[r.io];
-    const cls = ['trip', i === nextIdx ? 'next' : '', r.info.rt ? 'live' : '', r.etaO < nowMs - 30000 ? 'past' : '', r.trip.dayOffset ? 'tomorrow' : ''].join(' ');
+    const cls = ['trip', i === nextIdx ? 'next' : '', r.info.rt ? 'live' : '', r.etaO < nowMs - 30000 ? 'past' : '', r.trip.dayOffset ? 'tomorrow' : '', r.trip.id === state.selectedId ? 'sel' : ''].join(' ');
     const lbl = dayLabel(r.trip);
     const dep = (lbl ? `<span class="tag">${lbl}</span> ` : '') + (r.info.delayMin ? `<span class="strike small">${fmtHM(sO.sched)}</span> <b>${fmtHM(r.etaO)}</b>` : `<b>${fmtHM(r.etaO)}</b>`);
-    return `<div class="${cls}" data-id="${r.trip.id}">
+    return `<div class="${cls}" data-id="${r.trip.id}" title="Mostra aquest tren al mapa">
       <div>${badge(r.trip.line)}<div class="muted small">${r.trip.train || ''} ${r.trip.type || ''}</div></div>
       <div>${delayChip(r.info)} <span class="muted small">→ ${stationName(r.trip.stops[r.trip.stops.length - 1].sid)}</span></div>
       <div class="times">${dep} <span class="muted">→</span> ${fmtHM(r.etaD)}</div>
@@ -529,6 +529,26 @@ async function refresh() {
   }
   render();
 }
+// Click on a list row: centre the map on that train (its live/estimated position, or its departure station if it
+// has not left yet / arrival station if finished) and scroll the map into view.
+const FOCUS_ZOOM = 13;
+function focusTrain(id) {
+  const trip = state.trips.find(t => t.id === id) || state.days.flatMap(d => d.trips).find(t => t.id === id);
+  if (!trip) return;
+  state.selectedId = id;
+  for (const el of $('list').children) el.classList.toggle('sel', el.dataset.id === id);
+  const info = tripInfo(trip, Date.now());
+  let target = info.pos;
+  if (!target) { const sid = info.status === 'finished' ? trip.stops[trip.stops.length - 1].sid : trip.stops[0].sid; target = STATIONS[sid]; }
+  if (!target || !map.ready) return;
+  if (map.kind === 'google') { map.obj.panTo({ lat: target.lat, lng: target.lng }); map.obj.setZoom(FOCUS_ZOOM); }
+  else if (map.kind === 'leaflet') {
+    map.obj.setView([target.lat, target.lng], FOCUS_ZOOM);
+    const mk = map.markers.get(id); if (mk) mk.openTooltip();
+  }
+  $('map').scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
 // Show only VISIBLE_ROWS rows (from the next train on); the rest scrolls inside the card so the map stays close.
 // Scroll position is only reset when the next train changes, so periodic re-renders don't fight the user's scrolling.
 const VISIBLE_ROWS = 3;
@@ -568,6 +588,7 @@ function bind() {
   $('onlyLive').checked = settings.onlyLive;
   $('onlyLive').onchange = e => { settings.onlyLive = e.target.checked; saveSettings(); render(); };
   $('refresh').onclick = refresh;
+  $('list').onclick = e => { const row = e.target.closest('.trip'); if (row?.dataset.id) focusTrain(row.dataset.id); };
   $('toggleSettings').onclick = () => { $('settings').hidden = !$('settings').hidden; };
   $('gmapsKey').value = settings.gmapsKey; $('proxy').value = settings.proxy; $('feedUrl').value = settings.feedUrl;
   $('saveSettings').onclick = () => {
