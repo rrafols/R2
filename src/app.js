@@ -127,8 +127,9 @@ function dayLabel(trip) { // '' if the trip runs on the current calendar date, '
 function stopIndex(trip, sid) { return trip.stops.findIndex(s => s.sid === sid); }
 
 // ---------- realtime ----------
+// tripId = 4 digits + weekday letter (L M X J V S D, Spanish initials) + train number + line, e.g. 5149M25534R2S (a Tuesday R2S)
 function parseTripId(id) {
-  const m = /^\d{4}J(\d{4,6})([A-Za-z]+\d*[A-Za-z]*)$/.exec(id || '');
+  const m = /^\d{4}[A-Z](\d{4,6})([A-Za-z]+\d*[A-Za-z]*)$/.exec(id || '');
   return m ? { train: m[1], line: m[2].toUpperCase() } : null;
 }
 function needsProxy(url) { return /^https?:\/\/gtfsrt\.renfe\.com\//.test(url); }
@@ -306,6 +307,7 @@ function tripInfo(trip, nowMs) {
 
 // ---------- rendering ----------
 function stationName(sid) { return STATIONS[sid]?.name || sid; }
+function cap(str) { return str ? str[0].toUpperCase() + str.slice(1) : ''; }
 function badge(line) { return `<span class="badge ${line.toLowerCase()}">${LINES[line]?.name || line}</span>`; }
 function delayChip(info) {
   if (info.status === 'cancelled') return '<span class="delay cancel">Cancel·lat</span>';
@@ -315,7 +317,7 @@ function delayChip(info) {
   return `<span class="delay ${d > 0 ? 'late' : 'ok'}">${d > 0 ? '+' : ''}${d} min</span>`;
 }
 function whereText(info, trip) {
-  if (trip.dayOffset) { const l = dayLabel(trip) || 'avui'; return `${l[0].toUpperCase() + l.slice(1)}, surt de ${stationName(trip.stops[0].sid)} a les ${fmtHM(info.stops[0].eta)}`; }
+  if (trip.dayOffset) return `${cap(dayLabel(trip) || 'avui')}, surt de ${stationName(trip.stops[0].sid)} a les ${fmtHM(info.stops[0].eta)}`;
   if (info.status === 'notstarted') return `Encara no ha sortit de ${stationName(trip.stops[0].sid)}`;
   if (info.status === 'finished') return `Ha arribat a ${stationName(trip.stops[trip.stops.length - 1].sid)}`;
   if (info.status === 'cancelled') return 'Servei cancel·lat';

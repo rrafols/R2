@@ -47,7 +47,7 @@ Then make sure `DEFAULT_PROXY` in `src/app.js` matches the printed URL (with `/?
 - **Real time**: Renfe's open GTFS-RT feed, updated every 20 s, no API key, CC BY 4.0:
   - `https://gtfsrt.renfe.com/trip_updates.json` — delay per trip (`tripUpdate.delay`, seconds), next stop, cancellations, skipped stops
   - `https://gtfsrt.renfe.com/vehicle_positions.json` — GPS positions when available
-  - Trip IDs look like `5137J15021R15` → train **15021**, line **R15**; stop IDs are Adif station codes (71700 = Vilanova, 71801 = Sants…).
+  - Trip IDs look like `5137J15021R15` → 4 digits, weekday letter (L/M/X/J/V/S/D, Spanish initials; `J` = Thursday), train **15021**, line **R15**; stop IDs are Adif station codes (71700 = Vilanova, 71801 = Sants…).
 - Estimated time at any station = scheduled time + the trip's current delay. When a train has no GPS entry, its map position is interpolated between stations from the schedule + delay.
 
 ## Known limitations / things to check
