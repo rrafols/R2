@@ -391,7 +391,7 @@ function render() {
     `Trens del dia carregats: ${state.trips.length} · amb temps real: ${state.live.size} · vehicles amb GPS: ${state.vehicles.size}`,
     `Codis d'estació desconeguts: ${[...state.unknownStops].join(', ') || '—'}`,
     `Trens en directe no casats amb l'horari (${state.unmatched.length}):`,
-    ...state.unmatched.slice(0, 40).map(u => `  ${u.tripId} línia ${u.line} tren ${u.train} retard ${u.delaySec}s parada ${u.stopId} ${u.predMs ? fmtHM(u.predMs) : ''}`),
+    ...state.unmatched.slice(0, 40).map(u => `  ${u.tripId} línia ${u.line} tren ${u.train} retard ${u.delaySec}s ${u.stopId ? `parada ${u.stopId}${STATIONS[u.stopId] ? '' : ' (fora de l\'horari carregat)'} ${u.predMs ? fmtHM(u.predMs) : ''}` : 'sense propera parada al feed (a terminal / sense sortir)'}`),
   ].join('\n');
 }
 
@@ -440,7 +440,7 @@ function initMap() {
   destroyMap();
   const lines = relevantLines().length ? relevantLines() : ['R2S', 'R15'];
   const allSt = new Set(lines.flatMap(l => LINES[l].stations));
-  $('legend').innerHTML = lines.map(l => `<span><i style="background:${LINES[l].color}"></i>${LINES[l].name}</span>`).join('') + '<span><i style="background:#333;height:10px;width:10px;border-radius:50%"></i>tren (GPS) </span><span><i style="background:#fff;border:2px solid #333;height:8px;width:8px;border-radius:50%"></i>tren (estimat per horari)</span><span><i style="background:' + USER_COLOR + ';border:2px solid #fff;box-shadow:0 0 0 1px #999;height:10px;width:10px;border-radius:50%"></i>la teva ubicació</span>';
+  $('legend').innerHTML = lines.map(l => `<span><i style="background:${LINES[l].color}"></i>${LINES[l].name}</span>`).join('') + '<span><i style="background:#00A651;border:2px solid #111;height:10px;width:10px;border-radius:50%"></i>tren (GPS, color de la línia) </span><span><i style="background:#fff;border:2px solid #333;height:8px;width:8px;border-radius:50%"></i>tren (estimat per horari)</span><span><i style="background:' + USER_COLOR + ';border:2px solid #fff;box-shadow:0 0 0 1px #999;height:10px;width:10px;border-radius:50%"></i>la teva ubicació</span>';
   if (settings.gmapsKey && window.google?.maps) initGoogle(lines, allSt);
   else if (settings.gmapsKey) loadGoogle().then(() => initGoogle(lines, allSt)).catch(() => initLeaflet(lines, allSt));
   else initLeaflet(lines, allSt);
@@ -489,13 +489,14 @@ function updateMap(nowMs) {
     const color = LINES[trip.line]?.color || '#333';
     let mk = map.markers.get(trip.id);
     if (map.kind === 'google') {
-      const icon = { path: google.maps.SymbolPath.CIRCLE, scale: info.pos.gps ? 7 : 6, fillColor: info.pos.gps ? color : '#fff', fillOpacity: 1, strokeColor: color, strokeWeight: 2.5 };
-      if (!mk) { mk = new google.maps.Marker({ map: map.obj }); map.markers.set(trip.id, mk); }
+      const icon = { path: google.maps.SymbolPath.CIRCLE, scale: info.pos.gps ? 8 : 7, fillColor: info.pos.gps ? color : '#fff', fillOpacity: 1, strokeColor: info.pos.gps ? '#111' : color, strokeWeight: 2.5 };
+      if (!mk) { mk = new google.maps.Marker({ map: map.obj, zIndex: 500 }); map.markers.set(trip.id, mk); }
       mk.setPosition(info.pos); mk.setIcon(icon); mk.setTitle(label);
     } else {
-      const opt = { radius: info.pos.gps ? 8 : 7, color, fillColor: info.pos.gps ? color : '#fff', fillOpacity: 1, weight: 2.5 };
+      const opt = { radius: info.pos.gps ? 9 : 7, color: info.pos.gps ? '#111' : color, fillColor: info.pos.gps ? color : '#fff', fillOpacity: 1, weight: 2.5 };
       if (!mk) { mk = L.circleMarker([info.pos.lat, info.pos.lng], opt).addTo(map.obj).bindTooltip(label); map.markers.set(trip.id, mk); }
       else { mk.setLatLng([info.pos.lat, info.pos.lng]); mk.setStyle(opt); mk.setTooltipContent(label); }
+      mk.bringToFront(); // above station dots and the line
     }
   }
   for (const [id, mk] of map.markers) if (!seen.has(id)) { map.kind === 'google' ? mk.setMap(null) : mk.remove(); map.markers.delete(id); }
