@@ -376,13 +376,14 @@ function render() {
     const cls = ['trip', i === nextIdx ? 'next' : '', r.info.rt ? 'live' : '', r.etaO < nowMs - 30000 ? 'past' : '', r.trip.dayOffset ? 'tomorrow' : ''].join(' ');
     const lbl = dayLabel(r.trip);
     const dep = (lbl ? `<span class="tag">${lbl}</span> ` : '') + (r.info.delayMin ? `<span class="strike small">${fmtHM(sO.sched)}</span> <b>${fmtHM(r.etaO)}</b>` : `<b>${fmtHM(r.etaO)}</b>`);
-    return `<div class="${cls}">
+    return `<div class="${cls}" data-id="${r.trip.id}">
       <div>${badge(r.trip.line)}<div class="muted small">${r.trip.train || ''} ${r.trip.type || ''}</div></div>
       <div>${delayChip(r.info)} <span class="muted small">→ ${stationName(r.trip.stops[r.trip.stops.length - 1].sid)}</span></div>
       <div class="times">${dep} <span class="muted">→</span> ${fmtHM(r.etaD)}</div>
       <div class="where">${whereText(r.info, r.trip)}</div>
     </div>`;
   }).join('') || '<div class="muted">Cap tren per a aquest trajecte.</div>';
+  fitList(nextIdx);
 
   // map + diagnostics
   updateMap(nowMs);
@@ -527,6 +528,22 @@ async function refresh() {
     state.error = e.message; setStatus('sense temps real (només horari)', 'err');
   }
   render();
+}
+// Show only VISIBLE_ROWS rows (from the next train on); the rest scrolls inside the card so the map stays close.
+// Scroll position is only reset when the next train changes, so periodic re-renders don't fight the user's scrolling.
+const VISIBLE_ROWS = 3;
+let lastNextKey = null;
+function fitList(nextIdx) {
+  const list = $('list'); const rows = [...list.children].filter(el => el.classList.contains('trip'));
+  if (!rows.length) { list.style.maxHeight = ''; lastNextKey = null; return; }
+  const first = Math.max(0, nextIdx);
+  const h = rows.slice(first, first + VISIBLE_ROWS).reduce((a, r) => a + r.offsetHeight, 0);
+  if (h) list.style.maxHeight = h + 'px';
+  const key = rows[first].dataset.id;
+  const savedTop = list.scrollTop;
+  list.scrollTop = key !== lastNextKey ? rows[first].offsetTop - rows[0].offsetTop : savedTop;
+  lastNextKey = key;
+  $('listMore').hidden = rows.length <= first + VISIBLE_ROWS;
 }
 function setStatus(t, cls) { const s = $('status'); s.textContent = t; s.className = 'status ' + (cls || ''); }
 

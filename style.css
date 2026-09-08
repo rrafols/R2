@@ -31,7 +31,8 @@ button.link{background:none;border:none;color:#0a5fb5;padding:0;text-decoration:
 .badge{display:inline-block;color:#fff;font-weight:700;font-size:11px;padding:2px 6px;border-radius:3px;min-width:34px;text-align:center;background:#666}
 .badge.r2s,.badge.r2,.badge.r2n{background:var(--r2)}.badge.r15{background:var(--r15)}.badge.r17{background:var(--r17)}
 .badge.r14{background:var(--r14)}.badge.r16{background:var(--r16)}.badge.md{background:var(--md)}
-.list{display:flex;flex-direction:column}
+.list{display:flex;flex-direction:column;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}
+.listmore{text-align:center;padding-top:6px}
 .trip{display:grid;grid-template-columns:52px 1fr auto;gap:4px 10px;padding:8px 6px;border-bottom:1px solid var(--rule);align-items:center}
 .trip.next{background:var(--next)}
 .trip.live{border-left:4px solid #1e88c7}
