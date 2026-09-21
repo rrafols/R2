@@ -162,7 +162,7 @@ async function fetchJson(url) {
   throw lastErr || new Error('fetch failed');
 }
 
-const state = { selectedId: null, trips: [], days: [], live: new Map(), vehicles: new Map(), unmatched: [], unknownStops: new Set(), lastOk: null, error: null, sd: null };
+const state = { selectedId: null, trips: [], days: [], live: new Map(), vehicles: new Map(), unmatched: [], mismatched: new Set(), unknownStops: new Set(), lastOk: null, error: null, sd: null };
 
 function matchRealtime(tuFeed, vpFeed) {
   const sd = state.sd;
@@ -322,14 +322,44 @@ function locateOnTrip(trip, stops, p) {
   const n = stops.length - 1; return { segFrom: stops[n], segTo: stops[n], frac: 1 };
 }
 
+// Departure times of stops a train has already left, frozen at the last estimate made while the stop was still ahead
+// (key: trip id + stop). Cleared when the service day changes.
+const frozenEta = new Map();
 function tripInfo(trip, nowMs) {
-  const rt = state.live.get(trip.id);
+  let rt = state.live.get(trip.id) || null;
+  const veh = rt && state.vehicles.get(rt.train + '|' + rt.line);
+  const fresh = veh && veh.lat && !(veh.ts && nowMs - veh.ts > GPS_MAX_AGE_MS);
+  const probe = trip.stops.map((s, i) => i); // locateOnTrip returns entries of the array it is given: use indices
+  let loc = fresh && !rt.cancelled ? locateOnTrip(trip, probe, veh) : null;
+  // index of the stop Renfe reports as the next one (stop_time_update[0]); -1 if unknown / not a stop of this trip
+  let nextIdx = rt && rt.stopId ? stopIndex(trip, rt.stopId) : -1;
+  // Sanity check of the schedule match: the reported next stop cannot be behind the GPS position. If it is, this live
+  // record belongs to another train (typically one running the opposite way): ignore it rather than show nonsense.
+  if (loc && !loc.noGeom && nextIdx >= 0) {
+    const at = loc.segFrom === loc.segTo;
+    if (nextIdx < loc.segFrom - (at ? 1 : 0)) { state.mismatched.add(`${rt.tripId} ≠ ${trip.id}`); rt = null; loc = null; nextIdx = -1; }
+  }
   const delayMs = rt ? rt.delaySec * 1000 : 0;
-  const stops = trip.stops.map(s => ({ ...s, eta: s.sched + delayMs }));
+  // How many leading stops the train has already left, according to live data. The feed's delay is the delay at the
+  // NEXT stop: it must not be added to stops already behind the train, or a train held at Sitges with +28 min would
+  // still be announced as arriving at Vilanova "in 3 min".
+  let passed = 0;
+  if (loc && !loc.noGeom) passed = loc.segFrom === loc.segTo ? loc.segFrom : loc.segFrom + 1;
+  if (nextIdx > passed) passed = nextIdx;
+  const stops = trip.stops.map((s, i) => {
+    const key = trip.id + '|' + i; let eta = s.sched + delayMs, known = true;
+    if (i < passed) {
+      // frozen.seen = we watched this stop while it was still ahead, so the frozen time is a real estimate;
+      // otherwise (page opened later) all we know is "some time ago": don't present that as a departure time
+      if (!frozenEta.has(key)) frozenEta.set(key, { eta: Math.max(s.sched, Math.min(eta, nowMs - 60000)), seen: false });
+      const fz = frozenEta.get(key); eta = Math.min(fz.eta, nowMs - 60000); known = fz.seen;
+    } else if (rt) frozenEta.set(key, { eta, seen: true });
+    return { ...s, eta, passed: i < passed, known };
+  });
   const first = stops[0], last = stops[stops.length - 1];
   let status, segFrom = null, segTo = null, frac = 0;
   if (rt?.cancelled) status = 'cancelled';
-  else if (nowMs < first.eta - 60000) status = 'notstarted';
+  else if (!passed && nowMs < first.eta - 60000) status = 'notstarted';
   else if (nowMs > last.eta + 120000) status = 'finished';
   else {
     status = 'running';
@@ -341,21 +371,25 @@ function tripInfo(trip, nowMs) {
     }
     if (!segFrom) { segFrom = last; segTo = last; frac = 1; }
   }
-  let pos = null; const veh = rt && state.vehicles.get(rt.train + '|' + rt.line);
-  const fresh = veh && veh.lat && !(veh.ts && nowMs - veh.ts > GPS_MAX_AGE_MS);
-  const loc = fresh && status !== 'cancelled' ? locateOnTrip(trip, stops, veh) : null;
+  let pos = null;
   if (loc) {
     pos = { lat: veh.lat, lng: veh.lng, gps: true, placed: !loc.noGeom };
-    if (!loc.noGeom) { // the dot and the "Entre X i Y" text now come from the same GPS fix
-      ({ segFrom, segTo, frac } = loc);
+    if (!loc.noGeom) { // the dot and the "Entre X i Y" text come from the same GPS fix
+      segFrom = stops[loc.segFrom]; segTo = stops[loc.segTo]; frac = loc.frac;
       status = 'running'; // GPS says it is out there, whatever schedule + delay suggest
     } else if (status === 'running' && !segFrom) { segFrom = segTo = last; }
   }
-  else if (status === 'running' && segFrom && STATIONS[segFrom.sid] && STATIONS[segTo.sid]) {
+  if (!pos?.placed && status !== 'cancelled' && nextIdx >= 1) {
+    // no usable GPS, but Renfe says which stop is next: keep the estimate inside the segment that leads to it
+    const a = stops[nextIdx - 1], b = stops[nextIdx];
+    const f = (nowMs - (b.eta - (b.sched - a.sched))) / Math.max(1, b.sched - a.sched);
+    segFrom = a; segTo = b; frac = Math.min(0.97, Math.max(0.03, f)); status = 'running';
+  }
+  if (!pos && status === 'running' && segFrom && STATIONS[segFrom.sid] && STATIONS[segTo.sid]) {
     const p = alongTrack(segFrom.sid, segTo.sid, frac, trip.line);
     if (p) pos = { ...p, gps: false };
   }
-  return { rt, delayMin: Math.round(delayMs / 60000), stops, status, segFrom, segTo, frac, pos };
+  return { rt, delayMin: Math.round(delayMs / 60000), stops, passed, status, segFrom, segTo, frac, pos };
 }
 
 // ---------- rendering ----------
@@ -430,12 +464,13 @@ function render() {
     const sO = r.info.stops[r.io];
     const cls = ['trip', i === nextIdx ? 'next' : '', r.info.rt ? 'live' : '', r.etaO < nowMs - 30000 ? 'past' : '', r.trip.dayOffset ? 'tomorrow' : '', r.trip.id === state.selectedId ? 'sel' : ''].join(' ');
     const lbl = dayLabel(r.trip);
-    const dep = (lbl ? `<span class="tag">${lbl}</span> ` : '') + (r.info.delayMin ? `<span class="strike small">${fmtHM(sO.sched)}</span> <b>${fmtHM(r.etaO)}</b>` : `<b>${fmtHM(r.etaO)}</b>`);
+    const gone = r.info.stops[r.io].passed;
+    const dep = (lbl ? `<span class="tag">${lbl}</span> ` : '') + (gone && !sO.known ? `<b>${fmtHM(sO.sched)}</b>` : r.info.delayMin ? `<span class="strike small">${fmtHM(sO.sched)}</span> <b>${fmtHM(r.etaO)}</b>` : `<b>${fmtHM(r.etaO)}</b>`);
     return `<div class="${cls}" data-id="${r.trip.id}" title="Mostra aquest tren al mapa">
       <div>${badge(r.trip.line)}<div class="muted small">${r.trip.train || ''} ${r.trip.type || ''}</div></div>
       <div>${delayChip(r.info)} <span class="muted small">→ ${stationName(r.trip.stops[r.trip.stops.length - 1].sid)}</span></div>
       <div class="times">${dep} <span class="muted">→</span> ${fmtHM(r.etaD)}</div>
-      <div class="where">${whereText(r.info, r.trip)}</div>
+      <div class="where">${gone ? `Ja ha passat per ${stationName(o)} · ` : ''}${whereText(r.info, r.trip)}</div>
     </div>`;
   }).join('') || '<div class="muted">Cap tren per a aquest trajecte.</div>';
   fitList(nextIdx);
@@ -446,6 +481,7 @@ function render() {
     `Feed: ${state.lastOk ? 'ok ' + fmtHM(state.lastOk) : 'sense dades'} ${state.error ? '· error: ' + state.error : ''}`,
     `Trens del dia carregats: ${state.trips.length} · amb temps real: ${state.live.size} · vehicles amb GPS: ${state.vehicles.size}`,
     `Codis d'estació desconeguts: ${[...state.unknownStops].join(', ') || '—'}`,
+    `Dades en directe descartades per incoherents (GPS més enllà de la propera parada): ${[...state.mismatched].slice(0, 10).join(', ') || '—'}`,
     `Trens en directe no casats amb l'horari (${state.unmatched.length}):`,
     ...state.unmatched.slice(0, 40).map(u => `  ${u.tripId} línia ${u.line} tren ${u.train} retard ${u.delaySec}s ${u.stopId ? `parada ${u.stopId}${STATIONS[u.stopId] ? '' : ' (fora de l\'horari carregat)'} ${u.predMs ? fmtHM(u.predMs) : ''}` : 'sense propera parada al feed (a terminal / sense sortir)'}`),
   ].join('\n');
@@ -568,6 +604,7 @@ async function refresh() {
   if (!state.sd || state.sd.y !== sd.y || state.sd.m !== sd.m || state.sd.d !== sd.d) {
     state.sd = { ...sd };
     state.trips = tripsForDay(sd);
+    frozenEta.clear(); state.mismatched.clear();
     state.days = [{ sd, trips: state.trips }]; // later days are generated on demand by dayTrips()
     const hn = holidayName(sd);
     $('dayInfo').textContent = hn ? `Festiu: ${hn} (horari de diumenge)` : sd.dow === 0 ? 'Diumenge' : sd.dow === 6 ? 'Dissabte' : 'Dia feiner';
