@@ -98,12 +98,25 @@ function nextServiceDay(sd) {
 }
 // Trips of one service day. dayOffset 0 = the current service day; 1, 2… = following days, each with its own
 // timetable type (weekday / Saturday / Sunday-or-holiday), so the search for the next train crosses day boundaries correctly.
+// The timetable sheets label every north-bound coast train "R2" (south-bound ones are "R2S"), but LINES.R2 is the short
+// Sant Andreu–Castelldefels service. Give each R2-family trip the family line that actually contains all its stops, so
+// the badge, the track geometry and the map filter agree with where the train really runs.
+const lineFixCache = new Map();
+function scheduleLine(t) {
+  if (!R2_FAMILY.has(t.line)) return t.line;
+  const key = t.line + '|' + t.stops.map(s => s[0]).join(',');
+  if (!lineFixCache.has(key)) {
+    const fits = k => LINES[k] && t.stops.every(([sid]) => LINES[k].stations.includes(sid));
+    lineFixCache.set(key, fits(t.line) ? t.line : (['R2S', 'R2N', 'R2'].find(fits) || t.line));
+  }
+  return lineFixCache.get(key);
+}
 function tripsForDay(sd, dayOffset = 0) {
   const tags = dayTags(sd);
   return SCHEDULE.filter(t => tags.has(t.days)).map((t, i) => ({
     id: `${t.line}-${t.train || 's' + i}-${t.stops[0][1]}${dayOffset ? '@+' + dayOffset : ''}`, // distinct id: live data only attaches to today's copy
     dayOffset, sd,
-    line: t.line, train: t.train, type: t.type, src: t.src,
+    line: scheduleLine(t), train: t.train, type: t.type, src: t.src,
     stops: t.stops.map(([sid, time]) => ({ sid, min: hm(time), sched: epochOf(sd.y, sd.m, sd.d, hm(time)) })),
   }));
 }
@@ -187,6 +200,7 @@ function matchRealtime(tuFeed, vpFeed) {
   for (const e of (vpFeed?.entity || [])) {
     const v = e.vehicle; if (!v || !v.position) continue;
     const pid = parseTripId(v.trip?.tripId); if (!pid) continue;
+    if (!inRegion({ lat: +v.position.latitude, lng: +v.position.longitude })) continue; // 0,0 or garbage fix: fall back to the estimate
     vehicles.set(pid.train + '|' + pid.line, { lat: +v.position.latitude, lng: +v.position.longitude, status: v.currentStatus, stopId: v.stopId, ts: +(v.timestamp || 0) * 1000 });
   }
   state.live = live; state.unmatched = unmatched; state.vehicles = vehicles;
@@ -277,6 +291,37 @@ function alongTrack(a, b, frac, line) {
   return { lat: pts[pts.length - 1].lat, lng: pts[pts.length - 1].lng };
 }
 
+// nearest point of track g to p: { c: chainage in metres, off: distance from the track in metres }
+function projectToTrack(g, p) {
+  const { pts, cum } = g; let best = null;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1], kx = Math.cos(a.lat * Math.PI / 180);
+    const bx = (b.lng - a.lng) * kx, by = b.lat - a.lat, px = (p.lng - a.lng) * kx, py = p.lat - a.lat;
+    const len2 = bx * bx + by * by, f = len2 ? Math.min(1, Math.max(0, (px * bx + py * by) / len2)) : 0;
+    const q = { lat: a.lat + (b.lat - a.lat) * f, lng: a.lng + (b.lng - a.lng) * f }, off = distM(p, q);
+    if (!best || off < best.off) best = { off, c: cum[i] + (cum[i + 1] - cum[i]) * f };
+  }
+  return best;
+}
+const GPS_MAX_AGE_MS = 5 * 60000; // older fixes are dropped and the schedule estimate is used instead
+const GPS_MAX_OFF_M = 1500;       // further than this from the trip's track: not this train / bad fix
+const AT_STATION_M = 250;
+// Which pair of the trip's stops a GPS fix lies between. Returns null when the fix is clearly not on this trip's track
+// (reject it), or { noGeom: true } when there is no track geometry to check against (keep the dot, keep the schedule text).
+function locateOnTrip(trip, stops, p) {
+  const ids = trip.stops.map(s => s.sid);
+  const g = trackFor(ids[0], ids[ids.length - 1], trip.line); if (!g) return { noGeom: true };
+  const ch = ids.map(sid => g.st[sid]); if (ch.some(c => c === undefined)) return { noGeom: true };
+  const pr = projectToTrack(g, p); if (!pr || pr.off > GPS_MAX_OFF_M) return null;
+  const dir = ch[ch.length - 1] >= ch[0] ? 1 : -1, c = pr.c;
+  for (let i = 0; i < ch.length; i++) if (Math.abs(c - ch[i]) <= AT_STATION_M) return { segFrom: stops[i], segTo: stops[i], frac: 0 };
+  if ((c - ch[0]) * dir < 0) return { segFrom: stops[0], segTo: stops[0], frac: 0 };
+  for (let i = 0; i < ch.length - 1; i++) {
+    if ((c - ch[i]) * dir >= 0 && (ch[i + 1] - c) * dir > 0) return { segFrom: stops[i], segTo: stops[i + 1], frac: (c - ch[i]) / (ch[i + 1] - ch[i]) };
+  }
+  const n = stops.length - 1; return { segFrom: stops[n], segTo: stops[n], frac: 1 };
+}
+
 function tripInfo(trip, nowMs) {
   const rt = state.live.get(trip.id);
   const delayMs = rt ? rt.delaySec * 1000 : 0;
@@ -297,7 +342,15 @@ function tripInfo(trip, nowMs) {
     if (!segFrom) { segFrom = last; segTo = last; frac = 1; }
   }
   let pos = null; const veh = rt && state.vehicles.get(rt.train + '|' + rt.line);
-  if (veh && veh.lat) pos = { lat: veh.lat, lng: veh.lng, gps: true };
+  const fresh = veh && veh.lat && !(veh.ts && nowMs - veh.ts > GPS_MAX_AGE_MS);
+  const loc = fresh && status !== 'cancelled' ? locateOnTrip(trip, stops, veh) : null;
+  if (loc) {
+    pos = { lat: veh.lat, lng: veh.lng, gps: true, placed: !loc.noGeom };
+    if (!loc.noGeom) { // the dot and the "Entre X i Y" text now come from the same GPS fix
+      ({ segFrom, segTo, frac } = loc);
+      status = 'running'; // GPS says it is out there, whatever schedule + delay suggest
+    } else if (status === 'running' && !segFrom) { segFrom = segTo = last; }
+  }
   else if (status === 'running' && segFrom && STATIONS[segFrom.sid] && STATIONS[segTo.sid]) {
     const p = alongTrack(segFrom.sid, segTo.sid, frac, trip.line);
     if (p) pos = { ...p, gps: false };
@@ -321,9 +374,9 @@ function whereText(info, trip) {
   if (info.status === 'notstarted') return `Encara no ha sortit de ${stationName(trip.stops[0].sid)}`;
   if (info.status === 'finished') return `Ha arribat a ${stationName(trip.stops[trip.stops.length - 1].sid)}`;
   if (info.status === 'cancelled') return 'Servei cancel·lat';
-  if (info.segFrom === info.segTo) return `A ${stationName(info.segFrom.sid)}`;
-  if (info.frac < 0.08) return `Sortint de ${stationName(info.segFrom.sid)}`;
-  return `Entre ${stationName(info.segFrom.sid)} i ${stationName(info.segTo.sid)}${info.pos?.gps ? ' (GPS)' : ''}`;
+  if (info.segFrom === info.segTo) return `A ${stationName(info.segFrom.sid)}${info.pos?.placed ? ' (GPS)' : ''}`;
+  if (info.frac < 0.08 && !info.pos?.placed) return `Sortint de ${stationName(info.segFrom.sid)}`;
+  return `Entre ${stationName(info.segFrom.sid)} i ${stationName(info.segTo.sid)}${info.pos?.placed ? ' (GPS)' : ''}`;
 }
 
 function render() {
@@ -482,11 +535,14 @@ function initLeaflet(lines, allSt) {
 function updateMap(nowMs) {
   if (!map.ready) return;
   const lines = new Set(relevantLines().length ? relevantLines() : ['R2S', 'R15']);
+  const o = settings.origin, d = settings.destination;
   const seen = new Set();
   for (const trip of state.trips) {
-    if (!lines.has(trip.line)) continue;
+    // a train in the list must never be missing from the map: keep trips that call at both ends of the selected
+    // journey (either direction) even if their line label is not one of the drawn lines
+    if (!lines.has(trip.line) && !(stopIndex(trip, o) >= 0 && stopIndex(trip, d) >= 0)) continue;
     const info = tripInfo(trip, nowMs);
-    if (info.status !== 'running' || !info.pos) continue;
+    if (!info.pos || (info.status !== 'running' && !info.pos.gps)) continue;
     seen.add(trip.id);
     const label = `${LINES[trip.line]?.name || trip.line} ${trip.train || ''} → ${stationName(trip.stops[trip.stops.length - 1].sid)}\n${whereText(info, trip)}${info.rt ? ` · retard ${info.delayMin} min` : ' · sense dades en directe'}`;
     const color = LINES[trip.line]?.color || '#333';
@@ -539,12 +595,15 @@ function focusTrain(id) {
   if (!trip) return;
   state.selectedId = id;
   for (const el of $('list').children) el.classList.toggle('sel', el.dataset.id === id);
-  const info = tripInfo(trip, Date.now());
-  let target = info.pos;
+  const nowMs = Date.now();
+  updateMap(nowMs); // markers are otherwise up to 15 s old: make sure the train we centre on is drawn where we centre
+  const info = tripInfo(trip, nowMs);
+  let target = info.pos && map.markers.has(id) ? info.pos : null;
   if (!target) { const sid = info.status === 'finished' ? trip.stops[trip.stops.length - 1].sid : trip.stops[0].sid; target = STATIONS[sid]; }
   if (!target || !map.ready) return;
   if (map.kind === 'google') { map.obj.panTo({ lat: target.lat, lng: target.lng }); map.obj.setZoom(FOCUS_ZOOM); }
   else if (map.kind === 'leaflet') {
+    map.obj.invalidateSize(); // the container may have been resized since init (list height, rotation): otherwise the centre is off
     map.obj.setView([target.lat, target.lng], FOCUS_ZOOM);
     const mk = map.markers.get(id); if (mk) mk.openTooltip();
   }
