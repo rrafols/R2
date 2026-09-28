@@ -142,8 +142,19 @@ function stopIndex(trip, sid) { return trip.stops.findIndex(s => s.sid === sid);
 // ---------- realtime ----------
 // tripId = 4 digits + weekday letter (L M X J V S D, Spanish initials) + train number + line, e.g. 5149M25534R2S (a Tuesday R2S)
 function parseTripId(id) {
-  const m = /^\d{4}[A-Z](\d{4,6})([A-Za-z]+\d*[A-Za-z]*)$/.exec(id || '');
+  const m = /^\d{4}[A-Z](\d{4,6})([A-Za-z]+\d*[A-Za-z]*)$/.exec(id || '')
+    // tolerate a changed prefix / a suffix (e.g. "_1", date) rather than silently dropping every train
+    || /[A-Z](\d{4,6})(R[A-Z]?\d{1,2}[A-Z]?)(?:[^A-Za-z0-9].*)?$/.exec(id || '');
   return m ? { train: m[1], line: m[2].toUpperCase() } : null;
+}
+// GTFS-RT JSON may come camelCase (tripUpdate, stopTimeUpdate) or with proto field names (trip_update, stop_time_update)
+// depending on the serializer: normalise to camelCase so a format switch upstream doesn't silently empty the app.
+function camelKeys(x) {
+  if (Array.isArray(x)) return x.map(camelKeys);
+  if (!x || typeof x !== 'object') return x;
+  const out = {};
+  for (const k in x) out[k.replace(/_([a-z])/g, (_, c) => c.toUpperCase())] = camelKeys(x[k]);
+  return out;
 }
 function needsProxy(url) { return /^https?:\/\/gtfsrt\.renfe\.com\//.test(url); }
 async function fetchJson(url) {
@@ -162,48 +173,77 @@ async function fetchJson(url) {
   throw lastErr || new Error('fetch failed');
 }
 
-const state = { selectedId: null, trips: [], days: [], live: new Map(), vehicles: new Map(), unmatched: [], mismatched: new Set(), unknownStops: new Set(), lastOk: null, error: null, sd: null };
+const state = { selectedId: null, trips: [], days: [], live: new Map(), vehicles: new Map(), unmatched: [], mismatched: new Set(), unknownStops: new Set(), feedStats: null, lastOk: null, error: null, sd: null };
 
+const R2_MATCH_WINDOW_MS = 3.5 * 60000;
 function matchRealtime(tuFeed, vpFeed) {
-  const sd = state.sd;
-  const byTrain = new Map();
-  for (const t of state.trips) if (t.train) byTrain.set(t.train, t);
-  const live = new Map(); const unmatched = [];
-  for (const e of (tuFeed.entity || [])) {
-    const tu = e.tripUpdate; if (!tu || !tu.trip) continue;
-    const pid = parseTripId(tu.trip.tripId); if (!pid) continue;
-    const family = R2_FAMILY.has(pid.line) || /^R1[4-7]$/.test(pid.line) || byTrain.has(pid.train);
-    if (!family) continue;
-    const cancelled = tu.trip.scheduleRelationship === 'CANCELED';
-    const stu = (tu.stopTimeUpdate || [])[0];
-    const delaySec = tu.delay ?? stu?.arrival?.delay ?? stu?.departure?.delay ?? 0;
-    const skipped = (tu.stopTimeUpdate || []).filter(x => x.scheduleRelationship === 'SKIPPED').map(x => x.stopId);
-    const predMs = stu ? +((stu.arrival || stu.departure || {}).time || 0) * 1000 : 0;
-    if (stu && !STATIONS[stu.stopId]) state.unknownStops.add(`${stu.stopId} (${pid.line} ${pid.train})`);
-    let trip = byTrain.get(pid.train) || null;
-    if (!trip && stu && predMs) {
-      // R2 trips have no train numbers on the sheet: match by (predicted time - delay) at the reported stop
-      const schedMs = predMs - delaySec * 1000;
-      let best = null, bestD = 3.5 * 60000;
-      for (const t of state.trips) {
-        if (!R2_FAMILY.has(t.line)) continue;
-        const s = t.stops.find(x => x.sid === stu.stopId); if (!s) continue;
-        const d = Math.abs(s.sched - schedMs);
-        if (d < bestD) { bestD = d; best = t; }
-      }
-      trip = best;
-    }
-    const rec = { tripId: tu.trip.tripId, line: pid.line, train: pid.train, delaySec, cancelled, skipped, stopId: stu?.stopId, predMs, ts: +(tuFeed.header?.timestamp || 0) * 1000 };
-    if (trip) live.set(trip.id, rec); else unmatched.push(rec);
-  }
+  tuFeed = camelKeys(tuFeed || {}); vpFeed = vpFeed && camelKeys(vpFeed);
+  const headerMs = +(tuFeed.header?.timestamp || 0) * 1000;
+  // why a feed entity was (not) used: shown in Diagnòstic, so "0 trens amb temps real" can be told apart between
+  // an empty feed, an unparseable one and one with no trains of these lines
+  const stats = { headerMs, entities: (tuFeed.entity || []).length, tripUpdates: 0, badId: 0, badIdSample: [], otherLines: 0,
+    vpEntities: (vpFeed?.entity || []).length, vpNoPos: 0, vpBadId: 0, vpOutOfRegion: 0 };
   const vehicles = new Map();
   for (const e of (vpFeed?.entity || [])) {
-    const v = e.vehicle; if (!v || !v.position) continue;
-    const pid = parseTripId(v.trip?.tripId); if (!pid) continue;
-    if (!inRegion({ lat: +v.position.latitude, lng: +v.position.longitude })) continue; // 0,0 or garbage fix: fall back to the estimate
-    vehicles.set(pid.train + '|' + pid.line, { lat: +v.position.latitude, lng: +v.position.longitude, status: v.currentStatus, stopId: v.stopId, ts: +(v.timestamp || 0) * 1000 });
+    const v = e.vehicle; if (!v || !v.position) { stats.vpNoPos++; continue; }
+    const pid = parseTripId(v.trip?.tripId); if (!pid) { stats.vpBadId++; continue; }
+    const p = { lat: +v.position.latitude, lng: +v.position.longitude };
+    if (!inRegion(p)) { stats.vpOutOfRegion++; continue; } // 0,0 or garbage fix: fall back to the estimate
+    // no per-vehicle timestamp: assume the fix is as old as the feed rather than treating it as always fresh
+    vehicles.set(pid.train + '|' + pid.line, { ...p, status: v.currentStatus, stopId: v.stopId, ts: +(v.timestamp || 0) * 1000 || +(vpFeed.header?.timestamp || 0) * 1000 });
   }
-  state.live = live; state.unmatched = unmatched; state.vehicles = vehicles;
+  const byTrain = new Map();
+  for (const t of state.trips) if (t.train) byTrain.set(t.train, t);
+  const live = new Map(); const unmatched = []; const pairs = [];
+  for (const e of (tuFeed.entity || [])) {
+    const tu = e.tripUpdate; if (!tu || !tu.trip) continue;
+    stats.tripUpdates++;
+    const pid = parseTripId(tu.trip.tripId);
+    if (!pid) { stats.badId++; if (stats.badIdSample.length < 5) stats.badIdSample.push(String(tu.trip.tripId)); continue; }
+    const family = R2_FAMILY.has(pid.line) || /^R1[4-7]$/.test(pid.line) || byTrain.has(pid.train);
+    if (!family) { stats.otherLines++; continue; }
+    const rel = tu.trip.scheduleRelationship;
+    const cancelled = rel === 'CANCELED' || rel === 'CANCELLED' || rel === 3;
+    const stu = (tu.stopTimeUpdate || [])[0];
+    const delaySec = +(tu.delay ?? stu?.arrival?.delay ?? stu?.departure?.delay ?? 0);
+    const skipped = (tu.stopTimeUpdate || []).filter(x => x.scheduleRelationship === 'SKIPPED' || x.scheduleRelationship === 1).map(x => x.stopId);
+    const predMs = stu ? +((stu.arrival || stu.departure || {}).time || 0) * 1000 : 0;
+    if (stu && !STATIONS[stu.stopId]) state.unknownStops.add(`${stu.stopId} (${pid.line} ${pid.train})`);
+    const rec = { tripId: tu.trip.tripId, line: pid.line, train: pid.train, delaySec, cancelled, skipped, stopId: stu?.stopId, predMs, ts: headerMs };
+    const numbered = byTrain.get(pid.train);
+    if (numbered) { live.set(numbered.id, rec); continue; }
+    if (!stu || !predMs) { unmatched.push(rec); continue; }
+    // R2 trips have no train numbers on the sheet: match by (predicted time - delay) at the reported stop.
+    // Candidates whose track contradicts the train's GPS fix (off the line, or already past the reported next stop =
+    // typically the opposite direction) are dropped here, so the GPS of one train is never drawn as another.
+    const schedMs = predMs - delaySec * 1000, veh = freshVehicle(vehicles.get(pid.train + '|' + pid.line), Date.now());
+    let any = false;
+    for (const t of state.trips) {
+      if (!R2_FAMILY.has(t.line)) continue;
+      const si = stopIndex(t, stu.stopId); if (si < 0) continue;
+      const d = Math.abs(t.stops[si].sched - schedMs); if (d >= R2_MATCH_WINDOW_MS) continue;
+      if (veh && !cancelled && !gpsFitsTrip(t, si, veh)) continue;
+      pairs.push({ d, rec, trip: t }); any = true;
+    }
+    if (!any) unmatched.push(rec);
+  }
+  // one-to-one: closest pairs first, so two live trains never collapse onto the same timetable row
+  pairs.sort((a, b) => a.d - b.d);
+  const used = new Set();
+  for (const { rec, trip } of pairs) {
+    if (used.has(rec) || live.has(trip.id)) continue;
+    live.set(trip.id, rec); used.add(rec);
+  }
+  for (const rec of new Set(pairs.map(p => p.rec))) if (!used.has(rec)) unmatched.push(rec);
+  state.live = live; state.unmatched = unmatched; state.vehicles = vehicles; state.feedStats = stats;
+}
+function freshVehicle(veh, nowMs) { return veh && veh.lat && !(veh.ts && nowMs - veh.ts > GPS_MAX_AGE_MS) ? veh : null; }
+// is a GPS fix compatible with `trip` having stop `nextIdx` as its next stop?
+function gpsFitsTrip(trip, nextIdx, veh) {
+  const loc = locateOnTrip(trip, trip.stops.map((s, i) => i), veh);
+  if (!loc) return false;
+  if (loc.noGeom) return true;
+  return nextIdx >= loc.segFrom - (loc.segFrom === loc.segTo ? 1 : 0);
 }
 
 // ETA / position for a trip
@@ -327,8 +367,7 @@ function locateOnTrip(trip, stops, p) {
 const frozenEta = new Map();
 function tripInfo(trip, nowMs) {
   let rt = state.live.get(trip.id) || null;
-  const veh = rt && state.vehicles.get(rt.train + '|' + rt.line);
-  const fresh = veh && veh.lat && !(veh.ts && nowMs - veh.ts > GPS_MAX_AGE_MS);
+  const veh = rt && freshVehicle(state.vehicles.get(rt.train + '|' + rt.line), nowMs), fresh = !!veh;
   const probe = trip.stops.map((s, i) => i); // locateOnTrip returns entries of the array it is given: use indices
   let loc = fresh && !rt.cancelled ? locateOnTrip(trip, probe, veh) : null;
   // index of the stop Renfe reports as the next one (stop_time_update[0]); -1 if unknown / not a stop of this trip
@@ -479,12 +518,23 @@ function render() {
   updateMap(nowMs);
   $('diag').textContent = [
     `Feed: ${state.lastOk ? 'ok ' + fmtHM(state.lastOk) : 'sense dades'} ${state.error ? '· error: ' + state.error : ''}`,
+    ...feedStatsLines(state.feedStats, nowMs),
     `Trens del dia carregats: ${state.trips.length} · amb temps real: ${state.live.size} · vehicles amb GPS: ${state.vehicles.size}`,
     `Codis d'estació desconeguts: ${[...state.unknownStops].join(', ') || '—'}`,
     `Dades en directe descartades per incoherents (GPS més enllà de la propera parada): ${[...state.mismatched].slice(0, 10).join(', ') || '—'}`,
     `Trens en directe no casats amb l'horari (${state.unmatched.length}):`,
     ...state.unmatched.slice(0, 40).map(u => `  ${u.tripId} línia ${u.line} tren ${u.train} retard ${u.delaySec}s ${u.stopId ? `parada ${u.stopId}${STATIONS[u.stopId] ? '' : ' (fora de l\'horari carregat)'} ${u.predMs ? fmtHM(u.predMs) : ''}` : 'sense propera parada al feed (a terminal / sense sortir)'}`),
   ].join('\n');
+}
+
+// What the last feed contained and why entries were dropped: tells an empty/stale feed apart from a format change.
+function feedStatsLines(fs, nowMs) {
+  if (!fs) return [];
+  const age = fs.headerMs ? Math.round((nowMs - fs.headerMs) / 60000) : null;
+  return [
+    `  trip_updates: generat ${fs.headerMs ? fmtHM(fs.headerMs) + ` (fa ${age} min)` : '?'} · entitats ${fs.entities} · tripUpdate ${fs.tripUpdates} · altres línies ${fs.otherLines} · tripId il·legible ${fs.badId}${fs.badIdSample.length ? ' (p. ex. ' + fs.badIdSample.join(', ') + ')' : ''}`,
+    `  vehicle_positions: entitats ${fs.vpEntities} · sense posició ${fs.vpNoPos} · tripId il·legible ${fs.vpBadId} · fora de Catalunya ${fs.vpOutOfRegion}`,
+  ];
 }
 
 // ---------- map (Google Maps if key, else Leaflet/OSM) ----------
@@ -499,21 +549,37 @@ function originView() {
   const o = STATIONS[settings.origin];
   return o ? { lat: o.lat, lng: o.lng, zoom: ORIGIN_ZOOM } : DEFAULT_VIEW;
 }
-// Ask once for the device position; when it arrives (and is in Catalonia) show it as a marker. The view is not moved.
+// Follow the device position and show it as a marker (with its accuracy radius). The view is not moved.
+// watchPosition + enableHighAccuracy: a one-shot getCurrentPosition returned a coarse (Wi-Fi/cell, often km off) or
+// cached fix and the marker then never moved, so on a moving train it drifted further and further from reality.
 function locateUser() {
   if (geo.asked || !navigator.geolocation) return;
   geo.asked = true;
-  navigator.geolocation.getCurrentPosition(p => {
-    geo.pos = { lat: p.coords.latitude, lng: p.coords.longitude, acc: p.coords.accuracy };
+  navigator.geolocation.watchPosition(p => {
+    const acc = p.coords.accuracy;
+    // keep a precise fix rather than replacing it with a much coarser one that arrives shortly after
+    if (geo.pos && acc > 3 * geo.pos.acc && acc > 500 && p.timestamp - geo.pos.t < 60000) return;
+    geo.pos = { lat: p.coords.latitude, lng: p.coords.longitude, acc, t: p.timestamp };
     if (map.ready) showUser();
-  }, () => {}, { maximumAge: 300000, timeout: 10000 });
+  }, () => {}, { enableHighAccuracy: true, maximumAge: 10000, timeout: 30000 });
 }
 function showUser() {
-  if (!inRegion(geo.pos) || map.userMk) return;
+  if (!inRegion(geo.pos)) return;
+  const { lat, lng, acc } = geo.pos, tip = `La teva ubicació (±${Math.round(acc)} m)`;
   if (map.kind === 'google') {
-    map.userMk = new google.maps.Marker({ map: map.obj, position: geo.pos, title: 'La teva ubicació', zIndex: 1000, icon: { path: google.maps.SymbolPath.CIRCLE, scale: 8, fillColor: USER_COLOR, fillOpacity: 1, strokeColor: '#fff', strokeWeight: 2.5 } });
+    if (!map.userMk) {
+      map.userAcc = new google.maps.Circle({ map: map.obj, clickable: false, strokeColor: USER_COLOR, strokeOpacity: .5, strokeWeight: 1, fillColor: USER_COLOR, fillOpacity: .12 });
+      map.userMk = new google.maps.Marker({ map: map.obj, zIndex: 1000, icon: { path: google.maps.SymbolPath.CIRCLE, scale: 8, fillColor: USER_COLOR, fillOpacity: 1, strokeColor: '#fff', strokeWeight: 2.5 } });
+    }
+    map.userMk.setPosition({ lat, lng }); map.userMk.setTitle(tip);
+    map.userAcc.setCenter({ lat, lng }); map.userAcc.setRadius(acc);
   } else if (map.kind === 'leaflet') {
-    map.userMk = L.circleMarker([geo.pos.lat, geo.pos.lng], { radius: 8, color: '#fff', weight: 2.5, fillColor: USER_COLOR, fillOpacity: 1, pane: 'markerPane' }).addTo(map.obj).bindTooltip('La teva ubicació');
+    if (!map.userMk) {
+      map.userAcc = L.circle([lat, lng], { radius: acc, color: USER_COLOR, weight: 1, opacity: .5, fillOpacity: .12, interactive: false }).addTo(map.obj);
+      map.userMk = L.circleMarker([lat, lng], { radius: 8, color: '#fff', weight: 2.5, fillColor: USER_COLOR, fillOpacity: 1, pane: 'markerPane' }).addTo(map.obj).bindTooltip(tip);
+    }
+    map.userMk.setLatLng([lat, lng]); map.userMk.setTooltipContent(tip);
+    map.userAcc.setLatLng([lat, lng]); map.userAcc.setRadius(acc);
   }
 }
 function relevantLines() {
@@ -524,8 +590,8 @@ function destroyMap() {
   // Leaflet marks the container with _leaflet_id; clearing innerHTML is not enough, remove() is required
   // or the next L.map() throws "Map container is already initialized". Google has no destroy: drop refs and clear the DOM.
   if (map.kind === 'leaflet' && map.obj) map.obj.remove();
-  else if (map.kind === 'google') for (const mk of map.markers.values()) mk.setMap(null);
-  map.kind = null; map.obj = null; map.userMk = null; map.ready = false; map.markers.clear();
+  else if (map.kind === 'google') { for (const mk of map.markers.values()) mk.setMap(null); map.userMk?.setMap(null); map.userAcc?.setMap(null); }
+  map.kind = null; map.obj = null; map.userMk = null; map.userAcc = null; map.ready = false; map.markers.clear();
   $('map').innerHTML = '';
 }
 function initMap() {
