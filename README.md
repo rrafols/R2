@@ -41,6 +41,8 @@ npx wrangler deploy     # prints https://rodalies-proxy.<your-subdomain>.workers
 
 Then make sure `DEFAULT_PROXY` in `src/app.js` matches the printed URL (with `/?url=` appended), and add any extra origin you serve the app from to `ALLOWED_ORIGINS` in `worker/worker.js`.
 
+Or let GitHub Actions deploy it: `.github/workflows/deploy-worker.yml` runs on every push to `main` that changes `worker/`, and on demand from the Actions tab (*Deploy worker → Run workflow*). Add two repository secrets first (Settings → Secrets and variables → Actions): `CLOUDFLARE_API_TOKEN` (Cloudflare → My Profile → API Tokens → template *Edit Cloudflare Workers*) and `CLOUDFLARE_ACCOUNT_ID` (shown on the Workers & Pages overview).
+
 ## Data sources
 
 - **Schedule**: `data.js` was generated from the Rodalies PDFs. R15/R17/R14/R16/MD rows carry the train number, so live data is matched by number. R2 rows have no train number on the sheet, so R2 live trips are matched by *predicted time − delay ≈ scheduled time at the reported stop* (±3.5 min).

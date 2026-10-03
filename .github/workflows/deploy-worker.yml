@@ -1,0 +1,27 @@
+# Deploys the CORS relay in worker/ to Cloudflare Workers.
+# Runs on every push to main that changes worker/, or by hand from the Actions tab ("Run workflow").
+# Needs two repository secrets (Settings → Secrets and variables → Actions):
+#   CLOUDFLARE_API_TOKEN   – token from the "Edit Cloudflare Workers" template
+#   CLOUDFLARE_ACCOUNT_ID  – shown on the Workers & Pages overview in the Cloudflare dashboard
+name: Deploy worker
+
+on:
+  push:
+    branches: [main]
+    paths: ['worker/**']
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: worker
