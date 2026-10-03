@@ -24,6 +24,8 @@ export default {
       'Access-Control-Allow-Origin': ALLOWED_ORIGINS.has(origin) ? origin : DEFAULT_ORIGIN,
       'Access-Control-Allow-Methods': 'GET, OPTIONS',
       'Vary': 'Origin',
+      // let the app's Diagnòstic panel read these (cross-origin responses otherwise only expose "simple" headers)
+      'Access-Control-Expose-Headers': 'Date, Last-Modified, Age, CF-Cache-Status, X-Upstream-Status',
     };
 
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
@@ -45,6 +47,7 @@ export default {
     headers.set('Content-Type', upstream.headers.get('Content-Type') || 'application/json');
     headers.set('Cache-Control', `public, max-age=${CACHE_TTL_S}`);
     const lm = upstream.headers.get('Last-Modified'); if (lm) headers.set('Last-Modified', lm);
+    headers.set('X-Upstream-Status', String(upstream.status));
     for (const [k, v] of Object.entries(cors)) headers.set(k, v);
     return new Response(upstream.body, { status: upstream.status, headers });
   },

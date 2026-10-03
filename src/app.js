@@ -157,23 +157,32 @@ function camelKeys(x) {
   return out;
 }
 function needsProxy(url) { return /^https?:\/\/gtfsrt\.renfe\.com\//.test(url); }
-async function fetchJson(url) {
+// Last fetch of each feed (url, HTTP status, size, timing, cache headers), for the Diagnòstic panel.
+const fetchLog = {};
+const DEBUG_HEADERS = ['date', 'last-modified', 'age', 'cf-cache-status', 'x-upstream-status', 'content-type'];
+async function fetchJson(url, kind = url) {
   const proxy = settings.proxy || DEFAULT_PROXY;
   // Renfe's feed always fails CORS when fetched directly, so don't waste a request on it: go via the relay.
   // Local/fixture URLs are fetched as-is.
   const tryUrls = needsProxy(url) && proxy ? [proxy + encodeURIComponent(url)] : [url];
   let lastErr;
   for (const u of tryUrls) {
+    const log = fetchLog[kind] = { url: u, at: Date.now(), status: null, ms: null, bytes: null, headers: {}, error: null };
+    const t0 = performance.now();
     try {
       const r = await fetch(u, { cache: 'no-store' });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return await r.json();
-    } catch (e) { lastErr = e; }
+      log.status = r.status;
+      for (const h of DEBUG_HEADERS) { const v = r.headers.get(h); if (v) log.headers[h] = v; }
+      const text = await r.text();
+      log.ms = Math.round(performance.now() - t0); log.bytes = text.length;
+      if (!r.ok) throw new Error('HTTP ' + r.status + (text ? ': ' + text.slice(0, 120) : ''));
+      try { return JSON.parse(text); } catch { throw new Error('resposta no JSON: ' + text.slice(0, 120)); }
+    } catch (e) { lastErr = e; log.error = e.message; if (log.ms === null) log.ms = Math.round(performance.now() - t0); }
   }
   throw lastErr || new Error('fetch failed');
 }
 
-const state = { selectedId: null, trips: [], days: [], live: new Map(), vehicles: new Map(), unmatched: [], mismatched: new Set(), unknownStops: new Set(), feedStats: null, lastOk: null, error: null, sd: null };
+const state = { selectedId: null, trips: [], days: [], live: new Map(), vehicles: new Map(), unmatched: [], mismatched: new Set(), unknownStops: new Set(), feedStats: null, history: [], lastOk: null, error: null, sd: null };
 
 const R2_MATCH_WINDOW_MS = 3.5 * 60000;
 function matchRealtime(tuFeed, vpFeed) {
@@ -182,7 +191,11 @@ function matchRealtime(tuFeed, vpFeed) {
   // why a feed entity was (not) used: shown in Diagnòstic, so "0 trens amb temps real" can be told apart between
   // an empty feed, an unparseable one and one with no trains of these lines
   const stats = { headerMs, entities: (tuFeed.entity || []).length, tripUpdates: 0, badId: 0, badIdSample: [], otherLines: 0,
-    vpEntities: (vpFeed?.entity || []).length, vpNoPos: 0, vpBadId: 0, vpOutOfRegion: 0 };
+    vpHeaderMs: +(vpFeed?.header?.timestamp || 0) * 1000,
+    vpEntities: (vpFeed?.entity || []).length, vpNoPos: 0, vpBadId: 0, vpOutOfRegion: 0,
+    tuLines: countLines((tuFeed.entity || []).map(e => e.tripUpdate?.trip?.tripId)),
+    vpLines: countLines((vpFeed?.entity || []).map(e => e.vehicle?.trip?.tripId)),
+    tuSample: sampleOf(tuFeed.entity), vpSample: sampleOf(vpFeed?.entity) };
   const vehicles = new Map();
   for (const e of (vpFeed?.entity || [])) {
     const v = e.vehicle; if (!v || !v.position) { stats.vpNoPos++; continue; }
@@ -236,7 +249,22 @@ function matchRealtime(tuFeed, vpFeed) {
   }
   for (const rec of new Set(pairs.map(p => p.rec))) if (!used.has(rec)) unmatched.push(rec);
   state.live = live; state.unmatched = unmatched; state.vehicles = vehicles; state.feedStats = stats;
+  const rodalies = stats.tuLines.filter(([l]) => R2_FAMILY.has(l) || /^R1[4-7]$/.test(l)).reduce((a, [, n]) => a + n, 0);
+  state.history.unshift({ at: Date.now(), headerMs, entities: stats.entities, rodalies, live: live.size, vp: stats.vpEntities, gps: vehicles.size });
+  state.history.length = Math.min(state.history.length, 12);
 }
+// how many trips of each line a feed carries ("C2", "R2S"…), read from the end of the tripId even when it is not in
+// the usual format (e.g. SPECIAL_10_91072C2): shows at a glance whether Renfe is publishing any Rodalies train at all
+function countLines(ids) {
+  const out = new Map();
+  for (const id of ids) {
+    if (!id) continue;
+    const l = parseTripId(id)?.line || (/([A-Z]{1,3}\d{1,2}[A-Z]?)$/.exec(String(id))?.[1]) || '?';
+    out.set(l, (out.get(l) || 0) + 1);
+  }
+  return [...out].sort((a, b) => b[1] - a[1]);
+}
+function sampleOf(entities) { return entities?.length ? JSON.stringify(entities[0]).slice(0, 400) : null; }
 function freshVehicle(veh, nowMs) { return veh && veh.lat && !(veh.ts && nowMs - veh.ts > GPS_MAX_AGE_MS) ? veh : null; }
 // is a GPS fix compatible with `trip` having stop `nextIdx` as its next stop?
 function gpsFitsTrip(trip, nextIdx, veh) {
@@ -524,6 +552,7 @@ function render() {
     `Dades en directe descartades per incoherents (GPS més enllà de la propera parada): ${[...state.mismatched].slice(0, 10).join(', ') || '—'}`,
     `Trens en directe no casats amb l'horari (${state.unmatched.length}):`,
     ...state.unmatched.slice(0, 40).map(u => `  ${u.tripId} línia ${u.line} tren ${u.train} retard ${u.delaySec}s ${u.stopId ? `parada ${u.stopId}${STATIONS[u.stopId] ? '' : ' (fora de l\'horari carregat)'} ${u.predMs ? fmtHM(u.predMs) : ''}` : 'sense propera parada al feed (a terminal / sense sortir)'}`),
+    ...debugLines(nowMs),
   ].join('\n');
 }
 
@@ -535,6 +564,45 @@ function feedStatsLines(fs, nowMs) {
     `  trip_updates: generat ${fs.headerMs ? fmtHM(fs.headerMs) + ` (fa ${age} min)` : '?'} · entitats ${fs.entities} · tripUpdate ${fs.tripUpdates} · altres línies ${fs.otherLines} · tripId il·legible ${fs.badId}${fs.badIdSample.length ? ' (p. ex. ' + fs.badIdSample.join(', ') + ')' : ''}`,
     `  vehicle_positions: entitats ${fs.vpEntities} · sense posició ${fs.vpNoPos} · tripId il·legible ${fs.vpBadId} · fora de Catalunya ${fs.vpOutOfRegion}`,
   ];
+}
+
+// Detailed debug section of the Diagnòstic panel: what was fetched, what the feed contains, how it was matched.
+function debugLines(nowMs) {
+  const out = ['', '── Depuració ──'];
+  const ago = ms => ms ? `${fmtHM(ms)} (fa ${Math.round((nowMs - ms) / 1000)} s)` : '?';
+  for (const kind of ['trip_updates', 'vehicle_positions']) {
+    const f = fetchLog[kind]; if (!f) continue;
+    out.push(`Petició ${kind}: ${f.error ? 'ERROR ' + f.error : 'HTTP ' + f.status} · ${f.bytes ?? '?'} bytes · ${f.ms} ms · ${ago(f.at)}`);
+    out.push(`  ${f.url}`);
+    const h = Object.entries(f.headers).map(([k, v]) => `${k}: ${v}`).join(' · ');
+    if (h) out.push(`  ${h}`);
+  }
+  const fs = state.feedStats;
+  if (fs) {
+    const fmtLines = ls => ls.length ? ls.slice(0, 20).map(([l, n]) => `${l} ${n}`).join(' · ') + (ls.length > 20 ? ` · … (+${ls.length - 20})` : '') : '—';
+    out.push(`Línies a trip_updates: ${fmtLines(fs.tuLines)}`);
+    out.push(`Línies a vehicle_positions: ${fmtLines(fs.vpLines)}${fs.vpHeaderMs ? ` · generat ${ago(fs.vpHeaderMs)}` : ''}`);
+    if (fs.tuSample) out.push(`Mostra trip_updates[0]: ${fs.tuSample}`);
+    if (fs.vpSample) out.push(`Mostra vehicle_positions[0]: ${fs.vpSample}`);
+  }
+  if (state.history.length) {
+    out.push('Historial (hora · feed generat · entitats · Rodalies R2/R14-17 · casats · vehicles · amb GPS):');
+    for (const h of state.history) out.push(`  ${fmtHM(h.at)} · ${h.headerMs ? fmtHM(h.headerMs) : '?'} · ${h.entities} · ${h.rodalies} · ${h.live} · ${h.vp} · ${h.gps}`);
+  }
+  if (state.live.size) {
+    out.push(`Trens casats (${state.live.size}):`);
+    const byId = new Map(state.trips.map(t => [t.id, t]));
+    for (const [id, rt] of [...state.live].slice(0, 40)) {
+      const trip = byId.get(id), veh = state.vehicles.get(rt.train + '|' + rt.line);
+      const gps = veh ? `GPS ${veh.lat.toFixed(4)},${veh.lng.toFixed(4)} fa ${veh.ts ? Math.round((nowMs - veh.ts) / 1000) + ' s' : '?'}${freshVehicle(veh, nowMs) ? '' : ' (caducat)'}` : 'sense GPS';
+      out.push(`  ${rt.tripId} → ${id} · retard ${rt.delaySec}s · propera ${rt.stopId ? stationName(rt.stopId) : '—'}${rt.cancelled ? ' · CANCEL·LAT' : ''} · ${gps}${trip ? '' : ' (?)'}`);
+    }
+  }
+  out.push(`Configuració: feed ${settings.feedUrl || FEED_TU} · proxy ${settings.proxy || DEFAULT_PROXY + ' (per defecte)'} · mapa ${map.kind || '—'}`);
+  out.push(`Dia de servei: ${state.sd ? `${state.sd.d}/${state.sd.m}/${state.sd.y} (${[...dayTags(state.sd)].join(',')})` : '—'} · rellotge del dispositiu ${new Date(nowMs).toISOString()}${state.feedStats?.headerMs ? ` · desfasament amb el feed ${Math.round((nowMs - state.feedStats.headerMs) / 1000)} s` : ''}`);
+  out.push(`Ubicació: ${geo.pos ? `${geo.pos.lat.toFixed(5)},${geo.pos.lng.toFixed(5)} ±${Math.round(geo.pos.acc)} m fa ${Math.round((nowMs - geo.pos.t) / 1000)} s${inRegion(geo.pos) ? '' : ' (fora de la zona, no es mostra)'}` : geo.error ? 'error: ' + geo.error : geo.asked ? 'esperant…' : 'no demanada'}`);
+  out.push(`Navegador: ${navigator.userAgent}`);
+  return out;
 }
 
 // ---------- map (Google Maps if key, else Leaflet/OSM) ----------
@@ -559,9 +627,9 @@ function locateUser() {
     const acc = p.coords.accuracy;
     // keep a precise fix rather than replacing it with a much coarser one that arrives shortly after
     if (geo.pos && acc > 3 * geo.pos.acc && acc > 500 && p.timestamp - geo.pos.t < 60000) return;
-    geo.pos = { lat: p.coords.latitude, lng: p.coords.longitude, acc, t: p.timestamp };
+    geo.pos = { lat: p.coords.latitude, lng: p.coords.longitude, acc, t: p.timestamp }; geo.error = null;
     if (map.ready) showUser();
-  }, () => {}, { enableHighAccuracy: true, maximumAge: 10000, timeout: 30000 });
+  }, e => { geo.error = `${e.code} ${e.message}`; }, { enableHighAccuracy: true, maximumAge: 10000, timeout: 30000 });
 }
 function showUser() {
   if (!inRegion(geo.pos)) return;
@@ -680,7 +748,7 @@ async function refresh() {
   try {
     const feedUrl = settings.feedUrl || FEED_TU;
     const vpUrl = feedUrl === FEED_TU ? FEED_VP : feedUrl.replace(/trip_updates/, 'vehicle_positions');
-    const [tu, vp] = await Promise.all([fetchJson(feedUrl), fetchJson(vpUrl).catch(() => null)]);
+    const [tu, vp] = await Promise.all([fetchJson(feedUrl, 'trip_updates'), fetchJson(vpUrl, 'vehicle_positions').catch(() => null)]);
     matchRealtime(tu, vp);
     state.lastOk = Date.now(); state.error = null;
     const age = tu.header?.timestamp ? Math.round((Date.now() / 1000 - +tu.header.timestamp) / 60) : null;
@@ -752,6 +820,12 @@ function bind() {
   $('onlyLive').checked = settings.onlyLive;
   $('onlyLive').onchange = e => { settings.onlyLive = e.target.checked; saveSettings(); render(); };
   $('refresh').onclick = refresh;
+  $('copyDiag').onclick = async () => {
+    const b = $('copyDiag');
+    try { await navigator.clipboard.writeText($('diag').textContent); b.textContent = 'Copiat ✓'; }
+    catch { getSelection().selectAllChildren($('diag')); b.textContent = 'Selecciona i copia'; }
+    setTimeout(() => { b.textContent = 'Copia el diagnòstic'; }, 2000);
+  };
   $('list').onclick = e => { const row = e.target.closest('.trip'); if (row?.dataset.id) focusTrain(row.dataset.id); };
   $('nextCard').onclick = () => { const id = $('nextCard').dataset.id; if (id) focusTrain(id); };
   $('toggleSettings').onclick = () => { $('settings').hidden = !$('settings').hidden; };
