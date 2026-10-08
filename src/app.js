@@ -182,11 +182,12 @@ async function fetchJson(url, kind = url) {
   throw lastErr || new Error('fetch failed');
 }
 
-const state = { selectedId: null, trips: [], days: [], live: new Map(), vehicles: new Map(), unmatched: [], mismatched: new Set(), unknownStops: new Set(), feedStats: null, history: [], lastOk: null, error: null, sd: null };
+const state = { selectedId: null, trips: [], days: [], live: new Map(), vehicles: new Map(), unmatched: [], mismatched: new Set(), gpsTooEarly: new Set(), unknownStops: new Set(), feedStats: null, history: [], lastOk: null, error: null, sd: null };
 
 const R2_MATCH_WINDOW_MS = 3.5 * 60000;
 function matchRealtime(tuFeed, vpFeed) {
   tuFeed = camelKeys(tuFeed || {}); vpFeed = vpFeed && camelKeys(vpFeed);
+  state.gpsTooEarly.clear();
   const headerMs = +(tuFeed.header?.timestamp || 0) * 1000;
   // why a feed entity was (not) used: shown in Diagnòstic, so "0 trens amb temps real" can be told apart between
   // an empty feed, an unparseable one and one with no trains of these lines
@@ -234,8 +235,12 @@ function matchRealtime(tuFeed, vpFeed) {
     for (const t of state.trips) {
       if (!R2_FAMILY.has(t.line)) continue;
       const si = stopIndex(t, stu.stopId); if (si < 0) continue;
-      const d = Math.abs(t.stops[si].sched - schedMs); if (d >= R2_MATCH_WINDOW_MS) continue;
+      let d = Math.abs(t.stops[si].sched - schedMs); if (d >= R2_MATCH_WINDOW_MS) continue;
       if (veh && !cancelled && !gpsFitsTrip(t, si, veh)) continue;
+      // Renfe labels both directions of the coast line "R2S", so the line does not tell the direction, but the train
+      // number does: even numbers run towards Barcelona, odd ones away from it. Prefer candidates that agree; keep the
+      // others only as a fallback (a northbound and a southbound train often call at the same stop within minutes).
+      if ((+pid.train % 2 === 0) !== towardsBarcelona(t)) d += R2_MATCH_WINDOW_MS;
       pairs.push({ d, rec, trip: t }); any = true;
     }
     if (!any) unmatched.push(rec);
@@ -265,6 +270,15 @@ function countLines(ids) {
   return [...out].sort((a, b) => b[1] - a[1]);
 }
 function sampleOf(entities) { return entities?.length ? JSON.stringify(entities[0]).slice(0, 400) : null; }
+const BCN_SANTS = '71801';
+const towardsCache = new Map();
+function towardsBarcelona(trip) { // does the trip end closer to Barcelona-Sants than it starts?
+  if (!towardsCache.has(trip.id)) {
+    const c = STATIONS[BCN_SANTS], a = STATIONS[trip.stops[0].sid], b = STATIONS[trip.stops[trip.stops.length - 1].sid];
+    towardsCache.set(trip.id, !!(a && b && distM(b, c) < distM(a, c)));
+  }
+  return towardsCache.get(trip.id);
+}
 function freshVehicle(veh, nowMs) { return veh && veh.lat && !(veh.ts && nowMs - veh.ts > GPS_MAX_AGE_MS) ? veh : null; }
 // is a GPS fix compatible with `trip` having stop `nextIdx` as its next stop?
 function gpsFitsTrip(trip, nextIdx, veh) {
@@ -374,6 +388,7 @@ function projectToTrack(g, p) {
 const GPS_MAX_AGE_MS = 5 * 60000; // older fixes are dropped and the schedule estimate is used instead
 const GPS_MAX_OFF_M = 1500;       // further than this from the trip's track: not this train / bad fix
 const AT_STATION_M = 250;
+const EARLY_TOLERANCE_MS = 2 * 60000; // how early a train may plausibly leave a stop
 // Which pair of the trip's stops a GPS fix lies between. Returns null when the fix is clearly not on this trip's track
 // (reject it), or { noGeom: true } when there is no track geometry to check against (keep the dot, keep the schedule text).
 function locateOnTrip(trip, stops, p) {
@@ -406,6 +421,18 @@ function tripInfo(trip, nowMs) {
     const at = loc.segFrom === loc.segTo;
     if (nextIdx < loc.segFrom - (at ? 1 : 0)) { state.mismatched.add(`${rt.tripId} ≠ ${trip.id}`); rt = null; loc = null; nextIdx = -1; }
   }
+  // Trains never leave a station before the timetable says, so a stop scheduled more than a couple of minutes ahead
+  // cannot be behind the train, whatever the feed says. Renfe breaks this in two ways: before a train sets off, its
+  // first stop_time_update is often the SECOND stop (the origin has no arrival), and the vehicle position is then the
+  // coordinates of that stop rather than a real fix (several trains share the exact same point). Taken at face value,
+  // the 06:44 from Vilanova showed up at 06:29 as "already passed Vilanova · at Sitges (GPS)".
+  let canLeave = 0; // number of leading stops the train may already have left
+  while (canLeave < trip.stops.length && trip.stops[canLeave].sched <= nowMs + EARLY_TOLERANCE_MS) canLeave++;
+  if (loc && !loc.noGeom && (loc.segFrom === loc.segTo ? loc.segFrom : loc.segFrom + 1) > canLeave) {
+    state.gpsTooEarly.add(`${rt.tripId} → ${trip.id} (GPS a ${stationName(trip.stops[loc.segFrom].sid)})`);
+    loc = null; // the "fix" is ahead of where the train can be: ignore it and use the timetable
+  }
+  if (nextIdx > canLeave) nextIdx = canLeave || -1; // "next stop = 2nd stop" before departure means the origin is next
   const delayMs = rt ? rt.delaySec * 1000 : 0;
   // How many leading stops the train has already left, according to live data. The feed's delay is the delay at the
   // NEXT stop: it must not be added to stops already behind the train, or a train held at Sitges with +28 min would
@@ -446,7 +473,7 @@ function tripInfo(trip, nowMs) {
       status = 'running'; // GPS says it is out there, whatever schedule + delay suggest
     } else if (status === 'running' && !segFrom) { segFrom = segTo = last; }
   }
-  if (!pos?.placed && status !== 'cancelled' && nextIdx >= 1) {
+  if (!pos?.placed && status !== 'cancelled' && nextIdx >= 1 && nextIdx <= canLeave) {
     // no usable GPS, but Renfe says which stop is next: keep the estimate inside the segment that leads to it
     const a = stops[nextIdx - 1], b = stops[nextIdx];
     const f = (nowMs - (b.eta - (b.sched - a.sched))) / Math.max(1, b.sched - a.sched);
@@ -550,6 +577,7 @@ function render() {
     `Trens del dia carregats: ${state.trips.length} · amb temps real: ${state.live.size} · vehicles amb GPS: ${state.vehicles.size}`,
     `Codis d'estació desconeguts: ${[...state.unknownStops].join(', ') || '—'}`,
     `Dades en directe descartades per incoherents (GPS més enllà de la propera parada): ${[...state.mismatched].slice(0, 10).join(', ') || '—'}`,
+    `GPS ignorat (el tren encara no pot haver arribat allà segons l'horari): ${[...state.gpsTooEarly].slice(0, 10).join(', ') || '—'}`,
     `Trens en directe no casats amb l'horari (${state.unmatched.length}):`,
     ...state.unmatched.slice(0, 40).map(u => `  ${u.tripId} línia ${u.line} tren ${u.train} retard ${u.delaySec}s ${u.stopId ? `parada ${u.stopId}${STATIONS[u.stopId] ? '' : ' (fora de l\'horari carregat)'} ${u.predMs ? fmtHM(u.predMs) : ''}` : 'sense propera parada al feed (a terminal / sense sortir)'}`),
     ...debugLines(nowMs),
@@ -566,6 +594,13 @@ function feedStatsLines(fs, nowMs) {
   ];
 }
 
+// distance in metres when a vehicle position sits (almost) exactly on a station: Renfe then likely sent the stop's
+// coordinates rather than a real GPS fix
+function snappedTo(p) {
+  let best = Infinity;
+  for (const k in STATIONS) best = Math.min(best, distM(p, STATIONS[k]));
+  return best <= 30 ? Math.round(best) : null;
+}
 // Detailed debug section of the Diagnòstic panel: what was fetched, what the feed contains, how it was matched.
 function debugLines(nowMs) {
   const out = ['', '── Depuració ──'];
@@ -595,7 +630,8 @@ function debugLines(nowMs) {
     for (const [id, rt] of [...state.live].slice(0, 40)) {
       const trip = byId.get(id), veh = state.vehicles.get(rt.train + '|' + rt.line);
       const gps = veh ? `GPS ${veh.lat.toFixed(4)},${veh.lng.toFixed(4)} fa ${veh.ts ? Math.round((nowMs - veh.ts) / 1000) + ' s' : '?'}${freshVehicle(veh, nowMs) ? '' : ' (caducat)'}` : 'sense GPS';
-      out.push(`  ${rt.tripId} → ${id} · retard ${rt.delaySec}s · propera ${rt.stopId ? stationName(rt.stopId) : '—'}${rt.cancelled ? ' · CANCEL·LAT' : ''} · ${gps}${trip ? '' : ' (?)'}`);
+      const st = veh ? ` ${veh.status || ''}${veh.stopId ? ' ' + stationName(veh.stopId) : ''}${snappedTo(veh) !== null ? ` · a ${snappedTo(veh)} m d'una estació (posició de l'estació?)` : ''}` : '';
+      out.push(`  ${rt.tripId} → ${id} · retard ${rt.delaySec}s · propera ${rt.stopId ? stationName(rt.stopId) : '—'}${rt.predMs ? ' ' + fmtHM(rt.predMs) : ''}${rt.cancelled ? ' · CANCEL·LAT' : ''} · ${gps}${st}${trip ? '' : ' (?)'}`);
     }
   }
   out.push(`Configuració: feed ${settings.feedUrl || FEED_TU} · proxy ${settings.proxy || DEFAULT_PROXY + ' (per defecte)'} · mapa ${map.kind || '—'}`);
