@@ -536,6 +536,8 @@ function render() {
   const nc = $('nextCard');
   nc.dataset.id = nextIdx >= 0 ? rows[nextIdx].trip.id : '';
   nc.classList.toggle('clickable', nextIdx >= 0);
+  nc.classList.toggle('gps', nextIdx >= 0 && !!rows[nextIdx].info.pos?.gps);
+  nc.classList.toggle('nogps', nextIdx >= 0 && !rows[nextIdx].info.pos?.gps);
   if (o === d) nc.innerHTML = '<div class="muted">Tria dues estacions diferents.</div>';
   else if (nextIdx < 0) nc.innerHTML = `<div class="muted">Cap tren ${stationName(o)} → ${stationName(d)} a l'horari carregat.</div>`;
   else {
@@ -556,11 +558,12 @@ function render() {
   $('listTitle').textContent = `Trens ${stationName(o)} → ${stationName(d)}`;
   $('list').innerHTML = rows.slice(0, 40).map((r, i) => {
     const sO = r.info.stops[r.io];
-    const cls = ['trip', i === nextIdx ? 'next' : '', r.info.rt ? 'live' : '', r.etaO < nowMs - 30000 ? 'past' : '', r.trip.dayOffset ? 'tomorrow' : '', r.trip.id === state.selectedId ? 'sel' : ''].join(' ');
+    // side bar: green = position from the train's GPS, red = position estimated from the timetable (+ reported delay)
+    const cls = ['trip', i === nextIdx ? 'next' : '', r.info.rt ? 'live' : '', r.info.pos?.gps ? 'gps' : 'nogps', r.etaO < nowMs - 30000 ? 'past' : '', r.trip.dayOffset ? 'tomorrow' : '', r.trip.id === state.selectedId ? 'sel' : ''].join(' ');
     const lbl = dayLabel(r.trip);
     const gone = r.info.stops[r.io].passed;
     const dep = (lbl ? `<span class="tag">${lbl}</span> ` : '') + (gone && !sO.known ? `<b>${fmtHM(sO.sched)}</b>` : r.info.delayMin ? `<span class="strike small">${fmtHM(sO.sched)}</span> <b>${fmtHM(r.etaO)}</b>` : `<b>${fmtHM(r.etaO)}</b>`);
-    return `<div class="${cls}" data-id="${r.trip.id}" title="Mostra aquest tren al mapa">
+    return `<div class="${cls}" data-id="${r.trip.id}" title="${r.info.pos?.gps ? 'Posició per GPS' : 'Posició estimada per horari'} · mostra aquest tren al mapa">
       <div>${badge(r.trip.line)}<div class="muted small">${r.trip.train || ''} ${r.trip.type || ''}</div></div>
       <div>${delayChip(r.info)} <span class="muted small">→ ${stationName(r.trip.stops[r.trip.stops.length - 1].sid)}</span></div>
       <div class="times">${dep} <span class="muted">→</span> ${fmtHM(r.etaD)}</div>
