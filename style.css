@@ -1,4 +1,4 @@
-:root{--orange:#f26522;--ink:#222;--rule:#e2e2e2;--muted:#666;--live:#d6ecf7;--next:#fff3e6;
+:root{--orange:#f26522;--gps:#1e9e4a;--nogps:#d32f2f;--ink:#222;--rule:#e2e2e2;--muted:#666;--live:#d6ecf7;--next:#fff3e6;
   --r2:#00A651;--r15:#8C7A6B;--r17:#E63C2F;--r14:#7B5CB8;--r16:#1E5AA8;--md:#7F3F98}
 *{box-sizing:border-box}
 body{margin:0;font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;color:var(--ink);background:#f6f6f6;font-size:15px}
@@ -40,7 +40,12 @@ button.link{background:none;border:none;color:#0a5fb5;padding:0;text-decoration:
 .trip.sel{outline:2px solid var(--orange);outline-offset:-2px}
 .next.clickable{cursor:pointer}
 .next.clickable:hover{filter:brightness(.97)}
-.trip.live{border-left:4px solid #1e88c7}
+/* side bar: green = GPS position, red = timetable estimate (also on the next-train card, replacing its orange bar) */
+.trip{border-left:6px solid transparent}
+.trip.gps,.next.gps{border-left:6px solid var(--gps)}
+.trip.nogps,.next.nogps{border-left:6px solid var(--nogps)}
+.gpskey{font-size:12px;font-weight:400;color:var(--muted);white-space:nowrap}
+.gpskey i{display:inline-block;width:5px;height:12px;vertical-align:-1px;margin:0 3px 0 8px;border-radius:1px}
 .trip.past{opacity:.45}
 .trip .times{font-variant-numeric:tabular-nums;font-size:16px;text-align:right;white-space:nowrap}
 .trip .times b{font-size:18px}
