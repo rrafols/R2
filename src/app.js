@@ -196,7 +196,13 @@ function matchRealtime(tuFeed, vpFeed) {
     vpEntities: (vpFeed?.entity || []).length, vpNoPos: 0, vpBadId: 0, vpOutOfRegion: 0,
     tuLines: countLines((tuFeed.entity || []).map(e => e.tripUpdate?.trip?.tripId)),
     vpLines: countLines((vpFeed?.entity || []).map(e => e.vehicle?.trip?.tripId)),
-    tuSample: sampleOf(tuFeed.entity), vpSample: sampleOf(vpFeed?.entity) };
+    tuSample: sampleOf(tuFeed.entity), vpSample: sampleOf(vpFeed?.entity),
+    // every field Renfe fills for OUR lines' trains (e.g. vehicle.vehicle.label, occupancyStatus, multiCarriageDetails),
+    // with an example value: shows whether the feed says anything about platform, length or rolling stock
+    tuFields: fieldsOf((tuFeed.entity || []).filter(e => isOurLine(e.tripUpdate?.trip?.tripId))),
+    vpFields: fieldsOf((vpFeed?.entity || []).filter(e => isOurLine(e.vehicle?.trip?.tripId))),
+    labels: (vpFeed?.entity || []).filter(e => isOurLine(e.vehicle?.trip?.tripId))
+      .map(e => `${parseTripId(e.vehicle.trip.tripId).train}: ${e.vehicle.vehicle?.label ?? '—'}${e.vehicle.vehicle?.id ? ' (id ' + e.vehicle.vehicle.id + ')' : ''}`) };
   const vehicles = new Map();
   for (const e of (vpFeed?.entity || [])) {
     const v = e.vehicle; if (!v || !v.position) { stats.vpNoPos++; continue; }
@@ -204,7 +210,7 @@ function matchRealtime(tuFeed, vpFeed) {
     const p = { lat: +v.position.latitude, lng: +v.position.longitude };
     if (!inRegion(p)) { stats.vpOutOfRegion++; continue; } // 0,0 or garbage fix: fall back to the estimate
     // no per-vehicle timestamp: assume the fix is as old as the feed rather than treating it as always fresh
-    vehicles.set(pid.train + '|' + pid.line, { ...p, status: v.currentStatus, stopId: v.stopId, ts: +(v.timestamp || 0) * 1000 || +(vpFeed.header?.timestamp || 0) * 1000 });
+    vehicles.set(pid.train + '|' + pid.line, { ...p, status: v.currentStatus, stopId: v.stopId, label: v.vehicle?.label, ts: +(v.timestamp || 0) * 1000 || +(vpFeed.header?.timestamp || 0) * 1000 });
   }
   const byTrain = new Map();
   for (const t of state.trips) if (t.train) byTrain.set(t.train, t);
@@ -268,6 +274,18 @@ function countLines(ids) {
     out.set(l, (out.get(l) || 0) + 1);
   }
   return [...out].sort((a, b) => b[1] - a[1]);
+}
+function isOurLine(tripId) { const l = parseTripId(tripId)?.line; return !!l && (R2_FAMILY.has(l) || /^R1[4-7]$/.test(l)); }
+// "path = example value" for every leaf field seen in these entities (arrays collapsed to [])
+function fieldsOf(entities) {
+  const seen = new Map();
+  const walk = (x, path) => {
+    if (Array.isArray(x)) return x.forEach(v => walk(v, path + '[]'));
+    if (x && typeof x === 'object') { for (const k in x) walk(x[k], path ? path + '.' + k : k); return; }
+    if (!seen.has(path)) seen.set(path, String(x).slice(0, 40));
+  };
+  for (const e of entities) walk(e, '');
+  return [...seen].map(([k, v]) => `${k} = ${v}`);
 }
 function sampleOf(entities) { return entities?.length ? JSON.stringify(entities[0]).slice(0, 400) : null; }
 const BCN_SANTS = '71801';
@@ -622,6 +640,9 @@ function debugLines(nowMs) {
     out.push(`Línies a vehicle_positions: ${fmtLines(fs.vpLines)}${fs.vpHeaderMs ? ` · generat ${ago(fs.vpHeaderMs)}` : ''}`);
     if (fs.tuSample) out.push(`Mostra trip_updates[0]: ${fs.tuSample}`);
     if (fs.vpSample) out.push(`Mostra vehicle_positions[0]: ${fs.vpSample}`);
+    out.push(`Etiquetes dels vehicles R2/R14-17 (${fs.labels.length}): ${fs.labels.join(' · ') || '—'}`);
+    out.push(`Camps de trip_updates (R2/R14-17): ${fs.tuFields.join(' · ') || '—'}`);
+    out.push(`Camps de vehicle_positions (R2/R14-17): ${fs.vpFields.join(' · ') || '—'}`);
   }
   if (state.history.length) {
     out.push('Historial (hora · feed generat · entitats · Rodalies R2/R14-17 · casats · vehicles · amb GPS):');
@@ -633,7 +654,7 @@ function debugLines(nowMs) {
     for (const [id, rt] of [...state.live].slice(0, 40)) {
       const trip = byId.get(id), veh = state.vehicles.get(rt.train + '|' + rt.line);
       const gps = veh ? `GPS ${veh.lat.toFixed(4)},${veh.lng.toFixed(4)} fa ${veh.ts ? Math.round((nowMs - veh.ts) / 1000) + ' s' : '?'}${freshVehicle(veh, nowMs) ? '' : ' (caducat)'}` : 'sense GPS';
-      const st = veh ? ` ${veh.status || ''}${veh.stopId ? ' ' + stationName(veh.stopId) : ''}${snappedTo(veh) !== null ? ` · a ${snappedTo(veh)} m d'una estació (posició de l'estació?)` : ''}` : '';
+      const st = veh ? `${veh.label ? ' «' + veh.label + '»' : ''} ${veh.status || ''}${veh.stopId ? ' ' + stationName(veh.stopId) : ''}${snappedTo(veh) !== null ? ` · a ${snappedTo(veh)} m d'una estació (posició de l'estació?)` : ''}` : '';
       out.push(`  ${rt.tripId} → ${id} · retard ${rt.delaySec}s · propera ${rt.stopId ? stationName(rt.stopId) : '—'}${rt.predMs ? ' ' + fmtHM(rt.predMs) : ''}${rt.cancelled ? ' · CANCEL·LAT' : ''} · ${gps}${st}${trip ? '' : ' (?)'}`);
     }
   }
