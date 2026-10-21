@@ -540,9 +540,15 @@ function delayChip(info) {
 function whereText(info, trip) {
   if (trip.dayOffset) return `${cap(dayLabel(trip) || 'avui')}, surt de ${stationName(trip.stops[0].sid)} a les ${fmtHM(info.stops[0].eta)}`;
   if (info.status === 'notstarted') return `Encara no ha sortit de ${stationName(trip.stops[0].sid)}${info.held ? ` · sortida prevista ${fmtHM(info.stops[0].eta)}` : ''}`;
+  // no live data at all: the position is only what the timetable says, so say so (the train may still be at the platform)
+  if (!info.rt && info.status === 'running') return `Segons l'horari, ${uncap(whereRunning(info))} · sense dades en directe`;
   if (info.held && info.segFrom === info.segTo) return `Aturat a ${stationName(info.segFrom.sid)} · sortida prevista ${fmtHM(info.segFrom.eta)}`;
   if (info.status === 'finished') return `Ha arribat a ${stationName(trip.stops[trip.stops.length - 1].sid)}`;
   if (info.status === 'cancelled') return 'Servei cancel·lat';
+  return whereRunning(info);
+}
+function uncap(str) { return str ? str[0].toLowerCase() + str.slice(1) : ''; }
+function whereRunning(info) {
   if (info.segFrom === info.segTo) return `A ${stationName(info.segFrom.sid)}${info.pos?.placed ? ' (GPS)' : ''}`;
   if (info.frac < 0.08 && !info.pos?.placed) return `Sortint de ${stationName(info.segFrom.sid)}`;
   return `Entre ${stationName(info.segFrom.sid)} i ${stationName(info.segTo.sid)}${info.pos?.placed ? ' (GPS)' : ''}`;
@@ -583,6 +589,9 @@ function render() {
   else if (nextIdx < 0) nc.innerHTML = `<div class="muted">Cap tren ${stationName(o)} → ${stationName(d)} a l'horari carregat.</div>`;
   else {
     const r = rows[nextIdx]; const mins = Math.max(0, Math.round((r.etaO - nowMs) / 60000));
+    // a train that left in the last few minutes by timetable only (no live data): it may well still be at the platform
+    const prev = rows.slice(0, nextIdx).reverse().find(x => !x.info.rt && !x.trip.dayOffset && x.info.status !== 'cancelled' && x.etaO >= nowMs - 10 * 60000);
+    const prevNote = prev ? `<div class="sub prevnote">El de les ${fmtHM(prev.etaO)} no té dades en directe: si encara és a l'andana, és aquest.</div>` : '';
     const sO = r.info.stops[r.io], sD = r.info.stops[r.id];
     const lbl = dayLabel(r.trip);
     const when = lbl ? `${lbl} <span class="small">${fmtHM(r.etaO)}</span>` : mins >= 180 ? `a les ${fmtHM(r.etaO)}` : `${mins === 0 ? 'ara' : 'en ' + mins + ' min'} <span class="small">${fmtHM(r.etaO)}</span>`;
@@ -592,7 +601,7 @@ function render() {
       <div class="eta">${badge(r.trip.line)} ${r.trip.train ? '<span class="muted">' + r.trip.train + '</span>' : ''}
         arribada estimada a ${stationName(d)}: <b>${fmtHM(r.etaD)}</b>
         ${r.info.delayMin ? `<span class="muted small">(programat ${fmtHM(sD.sched)})</span>` : ''} ${delayChip(r.info)}</div>
-      <div class="sub">${whereText(r.info, r.trip)}</div>`;
+      <div class="sub">${whereText(r.info, r.trip)}</div>${prevNote}`;
   }
 
   // list
