@@ -182,12 +182,12 @@ async function fetchJson(url, kind = url) {
   throw lastErr || new Error('fetch failed');
 }
 
-const state = { selectedId: null, trips: [], days: [], live: new Map(), vehicles: new Map(), unmatched: [], mismatched: new Set(), gpsTooEarly: new Set(), unknownStops: new Set(), feedStats: null, history: [], lastOk: null, error: null, sd: null };
+const state = { selectedId: null, trips: [], days: [], live: new Map(), vehicles: new Map(), unmatched: [], mismatched: new Set(), gpsTooEarly: new Set(), held: new Set(), unknownStops: new Set(), feedStats: null, history: [], lastOk: null, error: null, sd: null };
 
 const R2_MATCH_WINDOW_MS = 3.5 * 60000;
 function matchRealtime(tuFeed, vpFeed) {
   tuFeed = camelKeys(tuFeed || {}); vpFeed = vpFeed && camelKeys(vpFeed);
-  state.gpsTooEarly.clear();
+  state.gpsTooEarly.clear(); state.held.clear();
   const headerMs = +(tuFeed.header?.timestamp || 0) * 1000;
   // why a feed entity was (not) used: shown in Diagnòstic, so "0 trens amb temps real" can be told apart between
   // an empty feed, an unparseable one and one with no trains of these lines
@@ -450,6 +450,7 @@ function tripInfo(trip, nowMs) {
     state.gpsTooEarly.add(`${rt.tripId} → ${trip.id} (GPS a ${stationName(trip.stops[loc.segFrom].sid)})`);
     loc = null; // the "fix" is ahead of where the train can be: ignore it and use the timetable
   }
+  const reportedNext = nextIdx; // the stop Renfe's predicted time (rt.predMs) refers to
   if (nextIdx > canLeave) nextIdx = canLeave || -1; // "next stop = 2nd stop" before departure means the origin is next
   const delayMs = rt ? rt.delaySec * 1000 : 0;
   // How many leading stops the train has already left, according to live data. The feed's delay is the delay at the
@@ -458,8 +459,25 @@ function tripInfo(trip, nowMs) {
   let passed = 0;
   if (loc && !loc.noGeom) passed = loc.segFrom === loc.segTo ? loc.segFrom : loc.segFrom + 1;
   if (nextIdx > passed) passed = nextIdx;
+  // ...but a train held at a platform is still there, whatever the clock says. Two signs Renfe gives:
+  //  - the vehicle reports STOPPED_AT one of the trip's stations;
+  //  - the predicted time at the next stop minus the scheduled running time from the stop before is still ahead, so
+  //    the train cannot have left that stop yet (Renfe omits a train's origin until it sets off, so this is the only
+  //    hint that the 06:35 is still sitting at Vilanova at 06:37).
+  let heldIdx = -1;
+  if (veh && veh.status === 'STOPPED_AT' && veh.stopId) {
+    const k = stopIndex(trip, veh.stopId);
+    if (k >= 0 && k <= canLeave && !(loc && !loc.noGeom && loc.segFrom > k)) heldIdx = k;
+  }
+  if (heldIdx < 0 && rt && reportedNext >= 1 && reportedNext === nextIdx && rt.predMs && !(loc && !loc.noGeom)) {
+    const k = reportedNext - 1, dep = rt.predMs - (trip.stops[reportedNext].sched - trip.stops[k].sched);
+    if (dep > nowMs + 30000) heldIdx = k;
+  }
+  if (heldIdx >= 0 && heldIdx <= passed) passed = heldIdx; else heldIdx = -1;
+  // a held train leaves "now at the earliest": push the held stop and everything after it back by the overrun
+  const holdMs = heldIdx >= 0 ? Math.max(0, nowMs - (trip.stops[heldIdx].sched + delayMs)) : 0;
   const stops = trip.stops.map((s, i) => {
-    const key = trip.id + '|' + i; let eta = s.sched + delayMs, known = true;
+    const key = trip.id + '|' + i; let eta = s.sched + delayMs + (heldIdx >= 0 && i >= heldIdx ? holdMs : 0), known = true;
     if (i < passed) {
       // frozen.seen = we watched this stop while it was still ahead, so the frozen time is a real estimate;
       // otherwise (page opened later) all we know is "some time ago": don't present that as a departure time
@@ -491,7 +509,10 @@ function tripInfo(trip, nowMs) {
       status = 'running'; // GPS says it is out there, whatever schedule + delay suggest
     } else if (status === 'running' && !segFrom) { segFrom = segTo = last; }
   }
-  if (!pos?.placed && status !== 'cancelled' && nextIdx >= 1 && nextIdx <= canLeave) {
+  if (heldIdx >= 0 && status !== 'cancelled' && !pos?.placed) {
+    segFrom = segTo = stops[heldIdx]; frac = 0;
+    status = heldIdx === 0 ? 'notstarted' : 'running';
+  } else if (!pos?.placed && status !== 'cancelled' && nextIdx >= 1 && nextIdx <= canLeave) {
     // no usable GPS, but Renfe says which stop is next: keep the estimate inside the segment that leads to it
     const a = stops[nextIdx - 1], b = stops[nextIdx];
     const f = (nowMs - (b.eta - (b.sched - a.sched))) / Math.max(1, b.sched - a.sched);
@@ -501,7 +522,8 @@ function tripInfo(trip, nowMs) {
     const p = alongTrack(segFrom.sid, segTo.sid, frac, trip.line);
     if (p) pos = { ...p, gps: false };
   }
-  return { rt, delayMin: Math.round(delayMs / 60000), stops, passed, status, segFrom, segTo, frac, pos };
+  if (heldIdx >= 0) state.held.add(`${rt.tripId} → ${trip.id} a ${stationName(trip.stops[heldIdx].sid)}${holdMs ? ` (+${Math.round(holdMs / 60000)} min sobre el retard comunicat)` : ''}`);
+  return { rt, delayMin: Math.round((delayMs + holdMs) / 60000), stops, passed, status, segFrom, segTo, frac, pos, held: heldIdx >= 0 };
 }
 
 // ---------- rendering ----------
@@ -517,7 +539,8 @@ function delayChip(info) {
 }
 function whereText(info, trip) {
   if (trip.dayOffset) return `${cap(dayLabel(trip) || 'avui')}, surt de ${stationName(trip.stops[0].sid)} a les ${fmtHM(info.stops[0].eta)}`;
-  if (info.status === 'notstarted') return `Encara no ha sortit de ${stationName(trip.stops[0].sid)}`;
+  if (info.status === 'notstarted') return `Encara no ha sortit de ${stationName(trip.stops[0].sid)}${info.held ? ` · sortida prevista ${fmtHM(info.stops[0].eta)}` : ''}`;
+  if (info.held && info.segFrom === info.segTo) return `Aturat a ${stationName(info.segFrom.sid)} · sortida prevista ${fmtHM(info.segFrom.eta)}`;
   if (info.status === 'finished') return `Ha arribat a ${stationName(trip.stops[trip.stops.length - 1].sid)}`;
   if (info.status === 'cancelled') return 'Servei cancel·lat';
   if (info.segFrom === info.segTo) return `A ${stationName(info.segFrom.sid)}${info.pos?.placed ? ' (GPS)' : ''}`;
@@ -599,6 +622,7 @@ function render() {
     `Codis d'estació desconeguts: ${[...state.unknownStops].join(', ') || '—'}`,
     `Dades en directe descartades per incoherents (GPS més enllà de la propera parada): ${[...state.mismatched].slice(0, 10).join(', ') || '—'}`,
     `GPS ignorat (el tren encara no pot haver arribat allà segons l'horari): ${[...state.gpsTooEarly].slice(0, 10).join(', ') || '—'}`,
+    `Trens encara aturats a una estació (STOPPED_AT o hora prevista a la propera parada): ${[...state.held].slice(0, 10).join(', ') || '—'}`,
     `Trens en directe no casats amb l'horari (${state.unmatched.length}):`,
     ...state.unmatched.slice(0, 40).map(u => `  ${u.tripId} línia ${u.line} tren ${u.train} retard ${u.delaySec}s ${u.stopId ? `parada ${u.stopId}${STATIONS[u.stopId] ? '' : ' (fora de l\'horari carregat)'} ${u.predMs ? fmtHM(u.predMs) : ''}` : 'sense propera parada al feed (a terminal / sense sortir)'}`),
     ...debugLines(nowMs),
